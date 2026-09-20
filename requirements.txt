@@ -1,0 +1,6 @@
+pytest>=7.0
+streamlit>=1.30
+pandas>=2.0
+pdfplumber>=0.10
+PyMuPDF>=1.23      # optional, preferred PDF backend (pdfplumber is the fallback)
+reportlab>=4.0     # only needed to generate PDFs in tests
