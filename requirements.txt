@@ -1,6 +1,30 @@
-pytest>=7.0
-streamlit>=1.30
-pandas>=2.0
-pdfplumber>=0.10
-PyMuPDF>=1.23      # optional, preferred PDF backend (pdfplumber is the fallback)
-reportlab>=4.0     # only needed to generate PDFs in tests
+# Contract Expiry Radar — dependencies
+# Core app
+streamlit>=1.35,<2.0
+
+# PDF extraction (ingestion.py tries these in order: PyMuPDF -> pdfplumber -> OCR)
+PyMuPDF>=1.24,<2.0
+pdfplumber>=0.11,<0.12
+
+# OCR fallback for scanned/image-only PDFs
+pdf2image>=1.17,<2.0
+pytesseract>=0.3.10,<0.4
+
+# Fuzzy matching (reserved for future contract/vendor de-duplication;
+# not required by the current MVP matching logic, which uses exact title
+# match, but listed per the spec's required stack)
+rapidfuzz>=3.6,<4.0
+
+# Date parsing helper used only where core/dateutils.py's own deterministic
+# parser is intentionally not extended further (kept as a documented,
+# available fallback library — not currently imported)
+python-dateutil>=2.9,<3.0
+
+# Testing
+pytest>=8.0,<9.0
+
+# NOTE: OCR (pdf2image + pytesseract) additionally requires the system
+# packages `poppler-utils` and `tesseract-ocr` to be installed via your OS
+# package manager (e.g. `apt-get install poppler-utils tesseract-ocr` on
+# Debian/Ubuntu). Without them, ingestion.py still works for PDFs that have
+# a real text layer -- OCR is only a fallback for scanned/image-only PDFs.

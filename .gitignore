@@ -1,4 +1,17 @@
-data/
-__pycache__/
-*.pyc
+# Local secrets and environment files
 .env
+
+# Local SQLite data and acquired documents
+data/*.db
+data/*.db-*
+data/acquired/
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local editor files
+.vscode/
