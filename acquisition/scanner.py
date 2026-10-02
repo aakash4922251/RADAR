@@ -3,15 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
 from dataclasses import asdict
 
 from acquisition.base import AcquisitionBlocked, SourceConnector
 from acquisition.downloader import DocumentDownloadError, download_document
 from acquisition.http import PublicHttpClient
 from acquisition.models import ScanSummary, TenderRecord
-from core import pipeline
-from core.radar import match_discovered_record, refresh_prediction
+from core.tender_pipeline import link_tender_to_requirement
 from db import database as db
 
 logger = logging.getLogger(__name__)
@@ -64,6 +62,7 @@ def scan_source(cur, connector: SourceConnector, *, client: PublicHttpClient | N
             )
             if is_new:
                 summary.records_new += 1
+            link_tender_to_requirement(cur, record_id)
             candidates = connector.fetch_documents(discovered)
             if not candidates:
                 db.set_discovered_record_status(
@@ -99,13 +98,10 @@ def scan_source(cur, connector: SourceConnector, *, client: PublicHttpClient | N
                     persisted["local_path"] = outcome["path"]
                     db.update_acquired_document(cur, acquired_id, **persisted, status="DOWNLOADED")
                     summary.documents_downloaded += 1
-                    ingest_result = _ingest_acquired_document(cur, discovered, candidate, outcome)
-                    db.update_acquired_document(cur, acquired_id, status="PROCESSED", document_id=ingest_result.document_id)
-                    if ingest_result.requirement_link and ingest_result.requirement_link.requirement_id:
-                        refresh_prediction(cur, ingest_result.requirement_link.requirement_id)
-                    match_discovered_record(cur, record_id)
-                    summary.documents_processed += 1
-                    db.set_discovered_record_status(cur, record_id, status="PROCESSED", acquisition_status="PROCESSED")
+                    db.set_discovered_record_status(
+                        cur, record_id, status="DISCOVERED",
+                        acquisition_status="TENDER_EVIDENCE_ONLY",
+                    )
                 except AcquisitionBlocked as exc:
                     db.update_acquired_document(cur, acquired_id, status="MANUAL_ACTION_REQUIRED", error_code="MANUAL_ACTION_REQUIRED", error_detail=exc.reason)
                     db.set_discovered_record_status(cur, record_id, acquisition_status="MANUAL_ACTION_REQUIRED", error=exc.reason)
@@ -141,27 +137,3 @@ def scan_source(cur, connector: SourceConnector, *, client: PublicHttpClient | N
         cur.connection.commit()
         logger.warning("acquisition source=%s run_id=%s failed: %s", connector.source_id, run_id, summary.error)
     return summary
-
-
-def _ingest_acquired_document(cur, record: TenderRecord, candidate, outcome):
-    filename = outcome["filename"]
-    if Path(filename).suffix.lower() not in {".pdf", ".txt", ".html", ".htm"}:
-        raise DocumentDownloadError(
-            "UNSUPPORTED_DOCUMENT_TYPE",
-            f"Downloaded {Path(filename).suffix.lower() or 'unknown'}; automatic ingestion supports PDF/TXT/HTML only",
-        )
-    doc_type = "corrigendum" if "corrig" in (record.title or "").lower() or "corrig" in candidate.document_url.lower() else "nit"
-    return pipeline.ingest_document(
-        cur, raw_bytes=outcome["body"], filename=filename, doc_type=doc_type,
-        contract_title=record.title or record.external_id,
-        source_url=candidate.document_url, source_org=record.organisation,
-        doc_title=filename, doc_date=_date_only(record.published_at),
-    )
-
-
-def _date_only(value):
-    if not value:
-        return None
-    import re
-    match = re.search(r"(\d{4})[-/]([01]?\d)[-/]([0-3]?\d)", value)
-    return "-".join(match.groups()) if match else None

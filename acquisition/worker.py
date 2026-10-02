@@ -17,7 +17,10 @@ def run_worker(source_id: str = "cppp", *, once: bool = False):
         raise RuntimeError("Acquisition is disabled")
     db.init_db()
     client = PublicHttpClient(timeout=config["request_timeout"], max_retries=config["max_retries"], rate_limit_delay=config["rate_limit_delay"])
-    connector = get_connector(source_id, client=client)
+    connector_kwargs = {"client": client}
+    if source_id == "cppp":
+        connector_kwargs["search_url"] = config["cppp_search_url"]
+    connector = get_connector(source_id, **connector_kwargs)
     interval_seconds = max(60, config["poll_interval_minutes"] * 60)
     while True:
         try:

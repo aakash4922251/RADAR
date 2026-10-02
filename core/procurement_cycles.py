@@ -53,8 +53,11 @@ def _pick_anchor(events_by_type: dict[str, list[str]]) -> Optional[str]:
     return None
 
 
-def compute_cycle_stats(cur, requirement_id: int) -> CycleStats:
+def compute_cycle_stats(cur, requirement_id: int, cutoff_date: Optional[str | date] = None) -> CycleStats:
     events = db.list_events_for_requirement(cur, requirement_id)
+    if cutoff_date is not None:
+        cutoff_iso = cutoff_date.isoformat() if isinstance(cutoff_date, date) else str(cutoff_date)
+        events = [e for e in events if not e["event_date"] or e["event_date"] <= cutoff_iso]
 
     events_by_type: dict[str, list[str]] = {}
     for e in events:

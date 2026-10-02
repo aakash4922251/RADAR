@@ -19,4 +19,7 @@ def settings() -> dict:
         "max_retries": int(os.environ.get("MAX_RETRIES", "3")),
         "rate_limit_delay": float(os.environ.get("RATE_LIMIT_DELAY_SECONDS", "1")),
         "storage_root": os.environ.get("ACQUISITION_STORAGE_ROOT", "data/acquired"),
+        "cppp_search_url": os.environ.get(
+            "CPPP_SEARCH_URL", "https://eprocure.gov.in/eprocure/app"
+        ),
     }

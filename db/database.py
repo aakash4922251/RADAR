@@ -39,6 +39,16 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     }
     if "estimated_value" not in discovered_columns:
         conn.execute("ALTER TABLE discovered_records ADD COLUMN estimated_value TEXT")
+    event_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(procurement_events)").fetchall()
+    }
+    if "discovered_record_id" not in event_columns:
+        conn.execute("ALTER TABLE procurement_events ADD COLUMN discovered_record_id INTEGER REFERENCES discovered_records(id)")
+    alias_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(requirement_aliases)").fetchall()
+    }
+    if "source_discovered_record_id" not in alias_columns:
+        conn.execute("ALTER TABLE requirement_aliases ADD COLUMN source_discovered_record_id INTEGER REFERENCES discovered_records(id)")
     # Older scans used the generic PENDING default when a source exposed
     # metadata but no document URL. Give those existing rows the accurate
     # metadata-only state without changing records that have documents queued.
@@ -544,6 +554,116 @@ def mark_prediction_matched(cur, prediction_id, record_id):
 
 
 # ---------------------------------------------------------------------
+# Layer 3 — Future procurement prediction
+# ---------------------------------------------------------------------
+def create_prediction(cur, *, requirement_id, predicted_window_start, predicted_window_end,
+                      prediction_basis, confidence, current_contract_state,
+                      prediction_status='PREDICTED', superseded_by=None) -> int:
+    cur.execute(
+        """INSERT INTO predictions
+           (requirement_id, predicted_window_start, predicted_window_end, prediction_basis,
+            confidence, current_contract_state, prediction_status, superseded_by)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (requirement_id, predicted_window_start, predicted_window_end, prediction_basis,
+         confidence, current_contract_state, prediction_status, superseded_by),
+    )
+    return cur.lastrowid
+
+
+def get_prediction(cur, prediction_id: int):
+    return cur.execute("SELECT * FROM predictions WHERE prediction_id = ?", (prediction_id,)).fetchone()
+
+
+def list_predictions_for_requirement(cur, requirement_id: int):
+    return cur.execute(
+        "SELECT * FROM predictions WHERE requirement_id = ? ORDER BY created_at DESC, prediction_id DESC",
+        (requirement_id,),
+    ).fetchall()
+
+
+def get_latest_prediction_for_requirement(cur, requirement_id: int):
+    return cur.execute(
+        "SELECT * FROM predictions WHERE requirement_id = ? ORDER BY created_at DESC, prediction_id DESC LIMIT 1",
+        (requirement_id,),
+    ).fetchone()
+
+
+def update_prediction_status(cur, prediction_id: int, prediction_status: str):
+    cur.execute(
+        "UPDATE predictions SET prediction_status = ? WHERE prediction_id = ?",
+        (prediction_status, prediction_id),
+    )
+
+
+def insert_prediction_evidence(cur, *, prediction_id, signal_name, signal_value=None,
+                              signal_detail: str = "") -> int:
+    cur.execute(
+        """INSERT INTO prediction_evidence
+           (prediction_id, signal_name, signal_value, signal_detail)
+           VALUES (?,?,?,?)""",
+        (prediction_id, signal_name, signal_value, signal_detail),
+    )
+    return cur.lastrowid
+
+
+def get_prediction_evidence(cur, prediction_id: int):
+    return cur.execute(
+        "SELECT * FROM prediction_evidence WHERE prediction_id = ? ORDER BY id ASC",
+        (prediction_id,),
+    ).fetchall()
+
+
+def insert_prediction_match(cur, *, prediction_id, event_id, match_status, match_score,
+                           match_evidence, matched_at=None) -> int:
+    cur.execute(
+        """INSERT INTO prediction_matches
+           (prediction_id, event_id, match_status, match_score, match_evidence, matched_at)
+           VALUES (?,?,?,?,?,?)""",
+        (prediction_id, event_id, match_status, match_score, match_evidence, matched_at or "datetime('now')"),
+    )
+    return cur.lastrowid
+
+
+def insert_prediction_outcome(cur, *, prediction_id, outcome_status, resolution_note) -> int:
+    cur.execute(
+        """INSERT INTO prediction_outcomes
+           (prediction_id, outcome_status, resolution_note)
+           VALUES (?,?,?)""",
+        (prediction_id, outcome_status, resolution_note),
+    )
+    return cur.lastrowid
+
+
+def insert_evaluation_run(cur, *, run_at=None, dataset_size, predictions_evaluated,
+                         confirmed_matches, probable_matches, unmatched,
+                         precision=None, recall=None, average_lead_time_days=None,
+                         notes="") -> int:
+    cur.execute(
+        """INSERT INTO evaluation_runs
+           (run_at, dataset_size, predictions_evaluated, confirmed_matches,
+            probable_matches, unmatched, precision, recall, average_lead_time_days, notes)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (run_at or "datetime('now')", dataset_size, predictions_evaluated, confirmed_matches,
+         probable_matches, unmatched, precision, recall, average_lead_time_days, notes),
+    )
+    return cur.lastrowid
+
+
+def list_prediction_matches(cur, prediction_id: int):
+    return cur.execute(
+        "SELECT * FROM prediction_matches WHERE prediction_id = ? ORDER BY matched_at DESC",
+        (prediction_id,),
+    ).fetchall()
+
+
+def get_latest_prediction_outcome(cur, prediction_id: int):
+    return cur.execute(
+        "SELECT * FROM prediction_outcomes WHERE prediction_id = ? ORDER BY resolved_at DESC, id DESC LIMIT 1",
+        (prediction_id,),
+    ).fetchone()
+
+
+# ---------------------------------------------------------------------
 # Layer 2 — Requirements
 # ---------------------------------------------------------------------
 def create_requirement(cur, *, org_id, asset_keyword, location, normalized_title) -> int:
@@ -577,18 +697,21 @@ def touch_requirement(cur, requirement_id: int):
     cur.execute("UPDATE requirements SET updated_at = datetime('now') WHERE id = ?", (requirement_id,))
 
 
-def add_requirement_alias(cur, *, requirement_id, alias_text, source_contract_id=None) -> int:
+def add_requirement_alias(cur, *, requirement_id, alias_text, source_contract_id=None,
+                                                    source_discovered_record_id=None) -> int:
     existing = cur.execute(
         """SELECT id FROM requirement_aliases
-           WHERE requirement_id = ? AND alias_text = ? AND source_contract_id IS ?""",
-        (requirement_id, alias_text, source_contract_id),
+                     WHERE requirement_id = ? AND alias_text = ? AND source_contract_id IS ?
+                         AND source_discovered_record_id IS ?""",
+                (requirement_id, alias_text, source_contract_id, source_discovered_record_id),
     ).fetchone()
     if existing:
         return existing["id"]
     cur.execute(
-        """INSERT INTO requirement_aliases (requirement_id, alias_text, source_contract_id)
-           VALUES (?,?,?)""",
-        (requirement_id, alias_text, source_contract_id),
+          """INSERT INTO requirement_aliases
+              (requirement_id, alias_text, source_contract_id, source_discovered_record_id)
+              VALUES (?,?,?,?)""",
+          (requirement_id, alias_text, source_contract_id, source_discovered_record_id),
     )
     return cur.lastrowid
 
@@ -621,22 +744,23 @@ def get_requirement_for_contract(cur, contract_id: int) -> Optional[sqlite3.Row]
 # Layer 2 — Procurement events
 # ---------------------------------------------------------------------
 def insert_procurement_event(cur, *, contract_id, event_type, event_date, document_id=None,
-                              source_fact_id=None, notes=None) -> Optional[int]:
+                              source_fact_id=None, discovered_record_id=None, notes=None) -> Optional[int]:
     """Idempotent: re-deriving the same event from the same document is a
     no-op (UNIQUE constraint on contract_id, event_type, event_date,
     document_id), returning the existing row's id instead of erroring."""
     existing = cur.execute(
         """SELECT id FROM procurement_events
-           WHERE contract_id IS ? AND event_type = ? AND event_date IS ? AND document_id IS ?""",
-        (contract_id, event_type, event_date, document_id),
+              WHERE contract_id IS ? AND discovered_record_id IS ? AND event_type = ?
+                 AND event_date IS ? AND document_id IS ?""",
+          (contract_id, discovered_record_id, event_type, event_date, document_id),
     ).fetchone()
     if existing:
         return existing["id"]
     cur.execute(
         """INSERT INTO procurement_events
-           (contract_id, event_type, event_date, document_id, source_fact_id, notes)
-           VALUES (?,?,?,?,?,?)""",
-        (contract_id, event_type, event_date, document_id, source_fact_id, notes),
+              (contract_id, discovered_record_id, event_type, event_date, document_id, source_fact_id, notes)
+              VALUES (?,?,?,?,?,?,?)""",
+          (contract_id, discovered_record_id, event_type, event_date, document_id, source_fact_id, notes),
     )
     return cur.lastrowid
 

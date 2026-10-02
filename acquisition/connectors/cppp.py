@@ -155,10 +155,10 @@ class CPPPConnector(SourceConnector):
     source_name = "Central Public Procurement Portal"
     capabilities = frozenset({"discovery", "metadata", "document_download"})
 
-    def __init__(self, client: PublicHttpClient | None = None, *, base_url=CPPP_BASE_URL):
+    def __init__(self, client: PublicHttpClient | None = None, *, base_url=CPPP_BASE_URL, search_url: str | None = None):
         self.client = client or PublicHttpClient()
         self.base_url = base_url.rstrip("/")
-        self.latest_tenders_url = self.base_url
+        self.latest_tenders_url = (search_url or self.base_url).strip()
         self.latest_corrigenda_url = self.base_url + "?page=FrontEndLatestActiveCorrigendums&service=page"
 
     def discover(self, since: str | None = None) -> DiscoveryResult:

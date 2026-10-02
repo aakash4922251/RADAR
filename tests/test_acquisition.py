@@ -6,6 +6,7 @@ from acquisition.downloader import DocumentDownloadError, download_document
 from acquisition.http import HttpResponse
 from acquisition.models import DiscoveryResult, DocumentCandidate, TenderRecord
 from acquisition.scanner import scan_source
+from core.backtesting import backtest_requirement_as_of
 from db import database as db
 
 
@@ -119,17 +120,99 @@ def test_scanner_ingests_new_document_into_layer1_and_layer2_once(cur, tmp_path)
 
     assert first.records_new == 1
     assert first.documents_downloaded == 1
-    assert first.documents_processed == 1
+    assert first.documents_processed == 0
     assert second.records_new == 0
     assert second.documents_skipped == 1
     assert client.calls == [document_url]
-    assert cur.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
-    assert cur.execute("SELECT COUNT(*) FROM procurement_events WHERE event_type = 'tender_published'").fetchone()[0] == 1
-    assert cur.execute("SELECT COUNT(*) FROM requirements").fetchone()[0] == 1
+    assert cur.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    assert cur.execute("SELECT COUNT(*) FROM contracts").fetchone()[0] == 0
     acquired = cur.execute("SELECT * FROM acquired_documents").fetchone()
-    assert acquired["status"] == "PROCESSED"
+    assert acquired["status"] == "DOWNLOADED"
     assert acquired["sha256"]
     assert Path(acquired["local_path"]).exists()
+    stored_record = cur.execute("SELECT * FROM discovered_records WHERE external_id = 'T-001'").fetchone()
+    assert stored_record["status"] == "DISCOVERED"
+    assert stored_record["acquisition_status"] == "TENDER_EVIDENCE_ONLY"
+
+
+def test_repeated_tenders_build_requirement_cycle_without_contracts(cur):
+    records = [
+        TenderRecord(
+            source_id="fixture", external_id=f"T-{year}", title=title,
+            organisation="XYZ Hospital", location="Pune", published_at=f"{year}-01-01",
+            source_page_url="https://fixture.example/list",
+        )
+        for year, title in [
+            ("2024", "Annual CCTV AMC Services"),
+            ("2025", "CCTV Surveillance Maintenance Contract"),
+            ("2026", "Comprehensive CCTV System Maintenance"),
+        ]
+    ]
+
+    connector = FixtureConnector(FakeClient({}), records)
+    summary = scan_source(cur, connector)
+    repeated_summary = scan_source(cur, connector)
+
+    assert summary.records_seen == 3
+    assert repeated_summary.records_seen == 3
+    assert cur.execute("SELECT COUNT(*) FROM contracts").fetchone()[0] == 0
+    requirements = db.list_requirements(cur)
+    assert len(requirements) == 1
+    requirement_id = requirements[0]["id"]
+    events = db.list_events_for_requirement(cur, requirement_id)
+    assert len(events) == 3
+    assert all(event["event_type"] == "tender_published" for event in events)
+    assert all(event["contract_id"] is None for event in events)
+    assert all(event["discovered_record_id"] is not None for event in events)
+    links = cur.execute(
+        "SELECT match_status, match_score, match_evidence FROM requirement_event_links WHERE requirement_id = ?",
+        (requirement_id,),
+    ).fetchall()
+    assert len(links) == 3
+    evidence = __import__("json").loads(links[-1]["match_evidence"])
+    assert evidence["source"] == "discovered tender record"
+    assert evidence["organisation"] == "exact match (confirmed same organisation)"
+    assert evidence["tender_reference"] == "T-2026"
+    aliases = db.list_aliases_for_requirement(cur, requirement_id)
+    assert len(aliases) == 3
+    assert {alias["source_discovered_record_id"] for alias in aliases} == {
+        event["discovered_record_id"] for event in events
+    }
+    cycle = db.get_latest_cycle(cur, requirement_id)
+    assert cycle["anchor_event_type"] == "tender_published"
+    assert cycle["n_cycles"] == 3
+    assert cur.execute(
+        "SELECT COUNT(*) FROM procurement_events WHERE event_type = 'tender_published'"
+    ).fetchone()[0] == 3
+    prediction = db.get_prediction_for_requirement(cur, requirement_id)
+    assert prediction is not None
+    assert prediction["confidence"] in ("LOW", "MEDIUM", "HIGH")
+    assert prediction["predicted_date"] == "2027-01-02"
+
+    backtest = backtest_requirement_as_of(cur, requirement_id, "2025-12-31")
+    assert backtest["used_events"] == 2
+    assert backtest["cycle_stats"].cycle_dates == ["2024-01-01", "2025-01-01"]
+    assert backtest["actual_event_date"] == "2026-01-01"
+    assert backtest["match_status"] == "MATCH"
+
+
+def test_cppp_connector_uses_configured_search_url():
+    search_url = "https://fixture.example/tenders/search"
+    client = FakeClient({search_url: HttpResponse(search_url, 200, {}, b"<html></html>")})
+    connector = CPPPConnector(client, search_url=search_url)
+
+    connector.discover()
+
+    assert client.calls == [search_url]
+
+
+def test_cppp_search_url_can_be_configured_from_environment(monkeypatch):
+    from acquisition.config import settings
+
+    search_url = "https://fixture.example/configured-search"
+    monkeypatch.setenv("CPPP_SEARCH_URL", search_url)
+
+    assert settings()["cppp_search_url"] == search_url
 
 
 def test_documentless_discovery_is_marked_metadata_only(cur):
@@ -192,7 +275,7 @@ def test_discovery_timeout_is_recorded_without_crashing_scan(cur):
     assert run["error"] == "The read operation timed out"
 
 
-def test_records_are_processed_even_when_discovery_also_reports_a_block(cur, tmp_path):
+def test_records_are_retained_when_discovery_also_reports_a_block(cur, tmp_path):
     document_url = "https://fixture.example/docs/partial.txt"
     body = b"CCTV AMC for XYZ Hospital. AMC for a period of 1 year."
     client = FakeClient({document_url: HttpResponse(document_url, 200, {"Content-Type": "text/plain"}, body)})
@@ -209,7 +292,7 @@ def test_records_are_processed_even_when_discovery_also_reports_a_block(cur, tmp
     summary = scan_source(cur, PartiallyBlockedConnector(client, [record]), client=client, storage_root=str(tmp_path))
     assert summary.status == "PARTIAL"
     assert summary.records_seen == 1
-    assert summary.documents_processed == 1
+    assert summary.documents_processed == 0
     assert summary.manual_action_required == 1
 
 

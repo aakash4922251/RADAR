@@ -14,7 +14,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     config = settings()
     client = PublicHttpClient(timeout=config["request_timeout"], max_retries=0, rate_limit_delay=config["rate_limit_delay"])
-    result = get_connector(args.source, client=client).health_check()
+    connector_kwargs = {"client": client}
+    if args.source == "cppp":
+        connector_kwargs["search_url"] = config["cppp_search_url"]
+    result = get_connector(args.source, **connector_kwargs).health_check()
     print(json.dumps(result, sort_keys=True))
     return 0 if result.get("status") == "HEALTHY" else 1
 

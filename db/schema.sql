@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS requirement_aliases (
     requirement_id INTEGER NOT NULL REFERENCES requirements(id),
     alias_text TEXT NOT NULL,
     source_contract_id INTEGER REFERENCES contracts(id),
+    source_discovered_record_id INTEGER REFERENCES discovered_records(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_aliases_requirement ON requirement_aliases(requirement_id);
@@ -225,6 +226,7 @@ CREATE INDEX IF NOT EXISTS idx_aliases_requirement ON requirement_aliases(requir
 CREATE TABLE IF NOT EXISTS procurement_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     contract_id INTEGER REFERENCES contracts(id),
+    discovered_record_id INTEGER REFERENCES discovered_records(id),
     event_type TEXT NOT NULL CHECK (event_type IN (
         'tender_published', 'bid_submission', 'tender_awarded',
         'contract_started', 'contract_extended', 'contract_ended',
@@ -280,6 +282,77 @@ CREATE TABLE IF NOT EXISTS procurement_cycles (
     superseded_by_cycle_id INTEGER REFERENCES procurement_cycles(id)
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_requirement ON procurement_cycles(requirement_id);
+
+-- =======================================================================
+-- LAYER 3 — FUTURE PROCUREMENT PREDICTION
+-- Append-only, evidence-first. Predictions are estimates derived from
+-- historical cycle statistics and current contract state; they are never
+-- a claim that a tender definitely exists.
+-- =======================================================================
+
+CREATE TABLE IF NOT EXISTS predictions (
+    prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requirement_id INTEGER NOT NULL REFERENCES requirements(id),
+    predicted_window_start TEXT NOT NULL,
+    predicted_window_end TEXT NOT NULL,
+    prediction_basis TEXT NOT NULL,
+    confidence TEXT NOT NULL CHECK (confidence IN ('HIGH','MEDIUM','LOW','INSUFFICIENT_DATA')),
+    current_contract_state TEXT,
+    prediction_status TEXT NOT NULL CHECK (prediction_status IN (
+        'PREDICTED','WATCHING','TENDER_DETECTED','CONFIRMED','INVALIDATED','EXPIRED_WITHOUT_DETECTION'
+    )) DEFAULT 'PREDICTED',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    superseded_by INTEGER REFERENCES predictions(prediction_id)
+);
+CREATE INDEX IF NOT EXISTS idx_predictions_requirement ON predictions(requirement_id, created_at);
+
+CREATE TABLE IF NOT EXISTS prediction_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id INTEGER NOT NULL REFERENCES predictions(prediction_id),
+    signal_name TEXT NOT NULL,
+    signal_value TEXT,
+    signal_detail TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_evidence_prediction ON prediction_evidence(prediction_id);
+
+CREATE TABLE IF NOT EXISTS prediction_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id INTEGER NOT NULL REFERENCES predictions(prediction_id),
+    event_id INTEGER NOT NULL REFERENCES procurement_events(id),
+    match_status TEXT NOT NULL CHECK (match_status IN (
+        'CONFIRMED_MATCH','PROBABLE_MATCH','UNRELATED_TENDER','REVIEW_REQUIRED'
+    )),
+    match_score REAL NOT NULL,
+    match_evidence TEXT NOT NULL,
+    matched_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_matches_prediction ON prediction_matches(prediction_id);
+
+CREATE TABLE IF NOT EXISTS prediction_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id INTEGER NOT NULL REFERENCES predictions(prediction_id),
+    outcome_status TEXT NOT NULL CHECK (outcome_status IN (
+        'PREDICTED','WATCHING','TENDER_DETECTED','CONFIRMED','INVALIDATED','EXPIRED_WITHOUT_DETECTION'
+    )),
+    resolved_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolution_note TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_outcomes_prediction ON prediction_outcomes(prediction_id);
+
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at TEXT NOT NULL DEFAULT (datetime('now')),
+    dataset_size INTEGER NOT NULL,
+    predictions_evaluated INTEGER NOT NULL,
+    confirmed_matches INTEGER NOT NULL,
+    probable_matches INTEGER NOT NULL,
+    unmatched INTEGER NOT NULL,
+    precision REAL,
+    recall REAL,
+    average_lead_time_days REAL,
+    notes TEXT NOT NULL
+);
 
 -- =======================================================================
 -- AUTOMATED PUBLIC-SOURCE ACQUISITION

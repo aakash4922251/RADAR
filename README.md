@@ -30,6 +30,35 @@ from Layer 2's measured historical cycles. They show the anchor event, median
 interval, dispersion, date window, and confidence; they do not claim a tender
 is certain to occur.
 
+## What's implemented — Layer 3 (Future Procurement Prediction)
+
+Layer 3 keeps the same explainable, rule-based philosophy as Layer 1 and Layer
+2: no machine-learning guesswork, no fake probabilities, no hidden logic.
+The system estimates a future procurement window from historical cycle stats,
+current contract state, and observed tender-before-expiry relationships, then
+stores the evidence behind the decision in the database.
+
+Key behavior:
+- `core/prediction_engine.py` computes explicit signals for interval regularity,
+  expiry offset, historical tender-to-expiry relationship, extension behaviour,
+  recurrence strength, timing stability, and lifecycle state.
+- Every prediction and explanation are persisted in `predictions` and
+  `prediction_evidence`, with an explicit status lifecycle.
+- `core/prediction_matching.py` matches a new tender against an open prediction
+  only when multiple supporting signals line up; same-org + same-word alone is
+  not enough.
+- `core/backtesting.py` simulates a historical as-of date and verifies the
+  prediction window against the actual next event without leaking future data.
+
+> Predictions are estimates based on historical procurement behaviour and
+> available official-source evidence. They do not guarantee that a
+> government tender will be issued.
+>
+> Absence of a detected tender does not prove that no procurement occurred.
+
+The app now includes a "Future Procurement" page that shows the live prediction
+window, confidence, and evidence for each requirement.
+
 ## Quick start
 
 ```bash
@@ -52,6 +81,15 @@ python -m acquisition.worker --source cppp
 # one-request source health check
 python -m acquisition.health --source cppp
 ```
+
+Set `CPPP_SEARCH_URL` in the environment to override the CPPP listing/search
+URL used by the app, scanner, worker, and health check. It defaults to
+`https://eprocure.gov.in/eprocure/app`.
+
+Automated discovery keeps tender records and downloaded tender documents
+separate from contracts. Dated tenders with a recognized service category are
+linked to a requirement with auditable match factors and can contribute to an
+inferred historical cycle; they do not create vendor or contract-expiry data.
 
 Run the test suite:
 
