@@ -9,6 +9,7 @@ import csv
 import io
 import os
 import sys
+from datetime import datetime
 
 import streamlit as st
 
@@ -22,6 +23,12 @@ from acquisition.http import PublicHttpClient
 from acquisition.registry import get_connector
 from acquisition.scanner import scan_source
 from radar_ui import (
+    buyer_display_name,
+    contract_status_label,
+    greeting_for_hour,
+    human_age,
+    opportunity_buckets,
+    timestamp_is_recent,
     render_alerts,
     render_analytics,
     render_backtesting,
@@ -69,46 +76,66 @@ DOC_TYPES = [
 # ---------------------------------------------------------------------
 # Sidebar navigation
 # ---------------------------------------------------------------------
-NAV_GROUPS = {
-    "RADAR": [
-        ("Overview", ":material/dashboard:"),
-        ("Opportunities", ":material/target:"),
-        ("Tenders", ":material/description:"),
-        ("Procurement Cycles", ":material/cycle:"),
-        ("Organisations", ":material/apartment:"),
-        ("Documents", ":material/folder_open:"),
-        ("Evidence", ":material/fact_check:"),
-    ],
-    "MONITORING": [
-        ("Live Monitor", ":material/sensors:"),
-        ("Sources", ":material/source:"),
-        ("Alerts", ":material/notifications:"),
-    ],
-    "SYSTEM": [
-        ("Analytics", ":material/monitoring:"),
-        ("Backtesting", ":material/science:"),
-        ("Settings", ":material/settings:"),
-        ("Contract Search", ":material/search:"),
-        ("Review Queue", ":material/rule:"),
-        ("Upload Document", ":material/upload_file:"),
-    ],
-}
+PRIMARY_NAV = [
+    ("Home", "Home", ":material/home:"),
+    ("Radar", "Radar", ":material/radar:"),
+    ("Alerts", "Alerts", ":material/notifications:"),
+    ("Search", "Search", ":material/search:"),
+    ("Monitoring", "Monitoring", ":material/sensors:"),
+]
+
+MORE_NAV = [
+    ("Tenders", "Tenders", ":material/description:"),
+    ("Procurement cycles", "Procurement Cycles", ":material/cycle:"),
+    ("Documents", "Documents", ":material/folder_open:"),
+    ("Organisations", "Organisations", ":material/apartment:"),
+    ("Evidence", "Evidence", ":material/fact_check:"),
+    ("Analytics", "Analytics", ":material/monitoring:"),
+    ("Backtesting", "Backtesting", ":material/science:"),
+    ("Sources", "Sources", ":material/source:"),
+    ("Settings", "Settings", ":material/settings:"),
+    ("Upload contract evidence", "Upload Document", ":material/upload_file:"),
+    ("Contract search", "Contract Search", ":material/search:"),
+    ("Review queue", "Review Queue", ":material/rule:"),
+]
 
 
 def set_active_page(name: str):
     st.session_state.active_page = name
+    if name == "Radar":
+        st.session_state.selected_requirement_id = None
 
 
 if "active_page" not in st.session_state:
-    st.session_state.active_page = "Overview"
+    st.session_state.active_page = "Home"
+elif st.session_state.active_page == "Overview":
+    st.session_state.active_page = "Home"
+elif st.session_state.active_page == "Opportunities":
+    st.session_state.active_page = "Radar"
+elif st.session_state.active_page == "Live Monitor":
+    st.session_state.active_page = "Monitoring"
 
-st.sidebar.markdown('<div class="radar-brand">PROCUREMENT RADAR</div><div class="radar-brand-sub">Government intelligence</div>', unsafe_allow_html=True)
-for group_name, destinations in NAV_GROUPS.items():
-    st.sidebar.markdown(f'<div class="nav-section">{group_name}</div>', unsafe_allow_html=True)
-    for destination, icon in destinations:
-        st.sidebar.button(
-            destination,
-            key=f"nav_{destination}",
+st.sidebar.markdown(
+    '<div class="radar-brand">PROCUREMENT RADAR</div>'
+    '<div class="radar-brand-sub">Government procurement, made clear</div>',
+    unsafe_allow_html=True,
+)
+for label, destination, icon in PRIMARY_NAV:
+    st.sidebar.button(
+        label,
+        key=f"primary_nav_{destination}",
+        icon=icon,
+        type="primary" if st.session_state.active_page == destination else "secondary",
+        use_container_width=True,
+        on_click=set_active_page,
+        args=(destination,),
+    )
+
+with st.sidebar.expander("More", expanded=st.session_state.active_page not in {item[1] for item in PRIMARY_NAV}):
+    for label, destination, icon in MORE_NAV:
+        st.button(
+            label,
+            key=f"more_nav_{destination}",
             icon=icon,
             type="primary" if st.session_state.active_page == destination else "secondary",
             use_container_width=True,
@@ -140,6 +167,8 @@ def get_radar_rows(cur, limit=None):
 
 def set_page_and_rerun(name: str):
     st.session_state.active_page = name
+    if name == "Radar":
+        st.session_state.selected_requirement_id = None
     st.rerun()
 
 if "selected_contract_id" not in st.session_state:
@@ -240,217 +269,152 @@ def render_contract_detail(cur, contract_id: int):
 # ---------------------------------------------------------------------
 # Overview
 # ---------------------------------------------------------------------
-if page == "Overview":
+if page == "Home":
     cur, conn = get_cursor()
     opportunities = get_radar_rows(cur)
     tender_count = cur.execute("SELECT COUNT(*) FROM discovered_records").fetchone()[0]
-    expiring_soon = cur.execute(
-        """SELECT COUNT(*) FROM contracts
-           WHERE current_expiry_estimate >= date('now')
-             AND current_expiry_estimate < date('now', '+91 days')
-             AND status != 'CANCELLED'"""
-    ).fetchone()[0]
+    coming_soon = sum("Coming Soon" in opportunity_buckets(item) for item in opportunities)
     config = acquisition_settings()
     sources = db.list_acquisition_sources(cur)
-    last_success = next((source["last_success_at"] for source in sources if source["source_key"] == "cppp"), None)
+    cppp_source = next((source for source in sources if source["source_key"] == "cppp"), None)
+    last_scan = cppp_source["last_scan_at"] if cppp_source else None
+    monitoring_enabled = config["enabled"] and config["cppp_enabled"]
+    user_name = os.environ.get("RADAR_USER_NAME", "there").strip() or "there"
 
-    st.markdown('<div class="eyebrow">Government procurement intelligence</div>', unsafe_allow_html=True)
-    title_col, status_col = st.columns([5, 1.6], vertical_alignment="center")
-    title_col.markdown('<div class="page-title">Procurement Radar</div>', unsafe_allow_html=True)
-    title_col.markdown('<div class="page-subtitle">Recurring requirements, upcoming windows, and current tender activity.</div>', unsafe_allow_html=True)
-    monitor_text = "CPPP ENABLED" if config["enabled"] and config["cppp_enabled"] else "MONITORING PAUSED"
-    monitor_class = "status-pill" if config["enabled"] and config["cppp_enabled"] else "status-pill paused"
-    status_col.markdown(
-        f'<div class="{monitor_class}"><span class="status-dot"></span>{monitor_text}</div>',
-        unsafe_allow_html=True,
-    )
-    if last_success:
-        st.caption(f"Last successful CPPP scan: {last_success}")
+    st.markdown(f'<div class="welcome-title">{greeting_for_hour(datetime.now().astimezone().hour, user_name)} 👋</div>', unsafe_allow_html=True)
+    st.markdown('<div class="welcome-copy">Your procurement radar is watching.</div>', unsafe_allow_html=True)
+    status_class = "status-pill" if monitoring_enabled else "status-pill paused"
+    status_label = "Monitoring CPPP" if monitoring_enabled else "Monitoring paused"
+    st.markdown(f'<span class="{status_class}"><span class="status-dot"></span>{status_label}</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="live-note">{human_age(last_scan)}</span>', unsafe_allow_html=True)
 
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("OPPORTUNITIES", len(opportunities))
-    metric_cols[1].metric("EXPIRING · 90D", expiring_soon)
-    metric_cols[2].metric("TENDERS FOUND", tender_count)
+    st.write("")
+    metrics = st.columns(3)
+    metrics[0].metric("Opportunities", len(opportunities))
+    metrics[1].metric("Coming soon", coming_soon)
+    metrics[2].metric("Tenders tracked", tender_count)
 
-    st.subheader("High-potential re-opportunities")
-    st.caption("Ranked by forecast timing and evidence confidence. Windows are inferred from observed history.")
-    if opportunities:
-        for offset in range(0, min(len(opportunities), 4), 2):
-            card_cols = st.columns(2)
-            for column, opportunity in zip(card_cols, opportunities[offset:offset + 2]):
-                with column:
-                    with st.container(border=True):
-                        st.markdown(f"**{opportunity['display_title']}**")
-                        st.caption(f"{opportunity['org_name'] or 'Organisation not resolved'} · {opportunity['asset_keyword']}")
-                        st.markdown(
-                            f"<span class='opportunity-window'>Expected window · {opportunity['window_start']} to {opportunity['window_end']}</span>",
-                            unsafe_allow_html=True,
-                        )
-                        st.write(
-                            f"Historical cycle: {round(opportunity['interval_days'])} days · "
-                            f"Evidence confidence: {opportunity['confidence']}"
-                        )
-                        if st.button(
-                            "View opportunity", key=f"overview_opportunity_{opportunity['requirement_id']}",
-                            icon=":material/arrow_forward:",
-                        ):
-                            st.session_state.selected_requirement_id = opportunity["requirement_id"]
-                            set_page_and_rerun("Opportunities")
-    else:
-        st.info("No re-opportunity windows yet. A requirement needs at least two dated procurement observations before a cycle can be estimated.")
-        if st.button("Browse observed tenders", icon=":material/description:"):
-            set_page_and_rerun("Tenders")
+    latest_run = db.list_acquisition_runs(cur, limit=1)
+    if latest_run and latest_run[0]["records_new"] and timestamp_is_recent(latest_run[0]["finished_at"]):
+        st.success(f"New tender notices found in the latest check: {latest_run[0]['records_new']}.")
 
-    activity, feed = st.columns([1.7, 1])
-    with activity:
-        st.subheader("Procurement activity")
-        monthly = cur.execute(
-            """SELECT substr(event_date, 1, 7) AS month, COUNT(*) AS events
-               FROM procurement_events
-               WHERE event_date >= date('now', '-12 months')
-               GROUP BY substr(event_date, 1, 7) ORDER BY month"""
-        ).fetchall()
-        if monthly:
-            st.bar_chart(
-                {"Month": [row["month"] for row in monthly], "Procurement events": [row["events"] for row in monthly]},
-                x="Month", y="Procurement events", color="#2876c7",
-            )
-        else:
-            st.info("Tender activity will appear here after dated procurements are observed.")
-    with feed:
-        st.subheader("Recent activity")
-        recent = cur.execute(
-            """SELECT happened_at, action, detail FROM (
-                   SELECT first_seen_at AS happened_at, 'Tender detected' AS action,
-                          COALESCE(title, external_id) AS detail FROM discovered_records
-                   UNION ALL
-                   SELECT finished_at, 'CPPP scan completed',
-                          status || ' · ' || records_seen || ' records' FROM acquisition_runs
-                   UNION ALL
-                   SELECT downloaded_at, 'Document acquired', COALESCE(filename, document_url)
-                   FROM acquired_documents WHERE downloaded_at IS NOT NULL
-                   UNION ALL
-                   SELECT pe.created_at, 'Requirement matched', r.normalized_title
-                   FROM procurement_events pe
-                   JOIN requirement_event_links rel ON rel.event_id = pe.id
-                   JOIN requirements r ON r.id = rel.requirement_id
-                   WHERE pe.discovered_record_id IS NOT NULL
-                   UNION ALL
-                   SELECT MAX(pc.computed_at), 'Cycle updated', r.normalized_title
-                   FROM procurement_cycles pc JOIN requirements r ON r.id = pc.requirement_id
-                   GROUP BY pc.requirement_id
-               ) WHERE happened_at IS NOT NULL
-               ORDER BY happened_at DESC LIMIT 7"""
-        ).fetchall()
-        if recent:
-            for item in recent:
-                st.markdown(f"**{item['action']}**")
-                st.write(item["detail"])
-                st.caption(item["happened_at"])
-        else:
-            st.info("No monitored activity recorded yet.")
-
-    action_cols = st.columns(3)
-    if action_cols[0].button("Open opportunities", icon=":material/target:", use_container_width=True):
-        set_page_and_rerun("Opportunities")
-    if action_cols[1].button("Browse tenders", icon=":material/description:", use_container_width=True):
-        set_page_and_rerun("Tenders")
-    if action_cols[2].button("Run source scan", icon=":material/sensors:", use_container_width=True):
-        set_page_and_rerun("Live Monitor")
+    st.write("")
+    home_actions = st.columns([1, 1, 3])
+    if home_actions[0].button("Explore Radar", type="primary", icon=":material/radar:", use_container_width=True):
+        set_page_and_rerun("Radar")
+    if home_actions[1].button("Latest activity", icon=":material/history:", use_container_width=True):
+        set_page_and_rerun("Monitoring")
 
 
 # ---------------------------------------------------------------------
 # Live Monitor
 # ---------------------------------------------------------------------
-elif page == "Live Monitor":
+elif page == "Monitoring":
     cur, conn = get_cursor()
-    st.markdown('<div class="eyebrow">Source operations</div>', unsafe_allow_html=True)
-    st.title("Live Monitor")
+    st.markdown('<div class="eyebrow">Government source status</div>', unsafe_allow_html=True)
+    st.title("Monitoring")
     config = acquisition_settings()
-    st.caption("Public-source monitoring persists discoveries and provenance. CAPTCHA, authentication, and blocked documents are shown for manual action.")
+    enabled = config["enabled"] and config["cppp_enabled"]
+    sources = db.list_acquisition_sources(cur)
+    cppp_source = next((source for source in sources if source["source_key"] == "cppp"), None)
+    runs = db.list_acquisition_runs(cur, limit=1)
+    latest_run = runs[0] if runs else None
+    last_scan = cppp_source["last_scan_at"] if cppp_source else None
 
-    col1, col2 = st.columns([3, 1])
-    col1.metric("Monitoring", "ON" if config["enabled"] else "OFF")
-    if col2.button("Run CPPP scan now", type="primary", disabled=not config["enabled"]):
+    badge_class = "status-pill" if enabled else "status-pill paused"
+    badge_text = "Monitoring enabled" if enabled else "Monitoring paused"
+    st.markdown(f'<span class="{badge_class}"><span class="status-dot"></span>{badge_text}</span>', unsafe_allow_html=True)
+    st.markdown(f'<div class="live-note">{human_age(last_scan)}</div>', unsafe_allow_html=True)
+
+    metrics = st.columns(3)
+    metrics[0].metric("New notices found", latest_run["records_new"] if latest_run else 0)
+    metrics[1].metric("Documents collected", latest_run["documents_downloaded"] if latest_run else 0)
+    manual_records = db.list_discovered_records(cur, acquisition_status="MANUAL_ACTION_REQUIRED")
+    metrics[2].metric("Need your help", len(manual_records))
+
+    if latest_run and latest_run["records_new"]:
+        st.success(f"✨ New procurement notices found: {latest_run['records_new']}.")
+
+    if st.button("Check government tenders", type="primary", icon=":material/sensors:", disabled=not enabled):
         client = PublicHttpClient(timeout=config["request_timeout"], max_retries=config["max_retries"], rate_limit_delay=config["rate_limit_delay"])
         try:
             connector = get_connector("cppp", client=client, search_url=config["cppp_search_url"])
-            with st.spinner("Scanning CPPP records and collecting linked documents..."):
+            st.markdown('<span class="status-pill scanning"><span class="status-dot"></span>Scanning government tenders...</span>', unsafe_allow_html=True)
+            with st.spinner("We're checking government sources..."):
                 summary = scan_source(cur, connector, client=client, storage_root=config["storage_root"])
             conn.commit()
-            message = (
-                f"Scan {summary.status}: {summary.records_seen} seen, "
-                f"{summary.records_new} new, {summary.documents_processed} processed."
-            )
             if summary.status == "FAILED":
-                st.error(f"{message} Run {summary.run_id}. Error: {summary.error or 'unknown error'}")
+                st.error("The source check could not be completed. Try again later.")
+                with st.expander("Technical details"):
+                    st.write(summary.error or "No error details were recorded.")
             elif summary.status == "PARTIAL":
-                st.warning(message)
+                st.warning(f"Check completed with {summary.records_seen} notices checked. Some items need attention.")
             else:
-                st.success(message)
+                if summary.records_new:
+                    st.success(f"✨ {summary.records_new} new tender notice(s) found.")
+                else:
+                    st.success(f"Check complete. {summary.records_seen} notice(s) checked; no new tenders found.")
             if summary.manual_action_required:
-                st.warning(f"{summary.manual_action_required} item(s) require manual action.")
+                st.info(f"{summary.manual_action_required} item(s) need your help. See Alerts.")
         except Exception as exc:
             conn.commit()
-            st.error(f"Scan failed: {exc}")
+            st.error("The source check could not be completed. Try again later.")
+            with st.expander("Technical details"):
+                st.write(str(exc))
 
-    sources = db.list_acquisition_sources(cur)
-    st.subheader("Sources")
-    if sources:
-        st.dataframe([
-            {"Source": source["name"], "Status": source["status"], "Last scan": source["last_scan_at"] or "never", "Last success": source["last_success_at"] or "never"}
-            for source in sources
-        ], use_container_width=True)
+    st.subheader("Latest activity")
+    recent_records = db.list_discovered_records(cur, limit=4)
+    if recent_records:
+        for record in recent_records:
+            st.write(f"{record['title'] or record['external_id']} · {record['organisation'] or 'Organisation not listed'}")
+            st.caption(human_age(record["first_seen_at"]))
     else:
-        st.info("No source has been scanned yet. The background worker can populate this view.")
+        st.markdown('<div class="empty-calm">We haven’t found any notices yet.</div>', unsafe_allow_html=True)
+        st.write("Run a check to start watching procurement.")
 
-    st.subheader("Manual action required")
-    manual_records = db.list_discovered_records(cur, acquisition_status="MANUAL_ACTION_REQUIRED")
-    if manual_records:
-        st.dataframe([
-            {"Tender": record["title"] or record["external_id"], "Organisation": record["organisation"] or "unknown", "Reason": record["last_error"] or "manual retrieval required", "Detail": record["detail_url"] or "not exposed"}
-            for record in manual_records
-        ], use_container_width=True)
-    else:
-        st.info("No manual-action records.")
-
-    st.subheader("Recent discoveries")
-    records = db.list_discovered_records(cur, limit=50)
-    if records:
-        st.dataframe([
-            {"Tender": record["title"] or record["external_id"], "Organisation": record["organisation"] or "unknown", "Location": record["location"] or "not exposed", "Published": record["published_at"] or "unknown", "Closing": record["closing_at"] or "unknown", "Tender value": record["estimated_value"] or "not exposed", "Source": record["source_name"], "Status": record["acquisition_status"]}
-            for record in records
-        ], use_container_width=True)
-    else:
-        st.info("No discoveries recorded yet.")
-
-    st.subheader("Recent scan runs")
-    runs = db.list_acquisition_runs(cur)
-    if runs:
-        st.dataframe([
-            {"Source": run["source_name"], "Started": run["started_at"], "Status": run["status"], "Seen": run["records_seen"], "New": run["records_new"], "Downloaded": run["documents_downloaded"], "Processed": run["documents_processed"], "Manual": run["manual_action_required"], "Failed": run["documents_failed"], "Error": run["error"] or ""}
-            for run in runs
-        ], use_container_width=True)
-    else:
-        st.info("No scan runs recorded yet.")
-
-    st.subheader("Opportunity radar")
-    predictions = db.list_predictions(cur, status="ACTIVE")
-    if predictions:
-        st.dataframe([
-            {"Requirement": prediction["normalized_title"], "Anchor": prediction["anchor_event_type"], "Expected": prediction["predicted_date"], "Window": f"{prediction['window_start']} to {prediction['window_end']}", "Confidence": prediction["confidence"]}
-            for prediction in predictions
-        ], use_container_width=True)
-    else:
-        st.info("No prediction window is available yet. At least two dated historical cycles are required.")
+    with st.expander("Advanced scan details"):
+        if cppp_source:
+            st.write(f"Source: {cppp_source['name']}")
+            st.write(f"Last successful check: {cppp_source['last_success_at'] or 'None yet'}")
+            st.write(f"Configured check interval: {config['poll_interval_minutes']} minutes")
+        st.write(f"Search page: {config['cppp_search_url']}")
+        if latest_run:
+            st.write(f"Last run status: {latest_run['status']} · {latest_run['records_seen']} record(s) checked · {latest_run['documents_downloaded']} document(s) collected")
 
 
 # ---------------------------------------------------------------------
 # Radar: dedicated tender and intelligence screens
 # ---------------------------------------------------------------------
-elif page == "Opportunities":
+elif page == "Radar":
     cur, conn = get_cursor()
     render_opportunities(cur)
+
+elif page == "Search":
+    cur, conn = get_cursor()
+    st.markdown('<div class="eyebrow">Find procurement information</div>', unsafe_allow_html=True)
+    st.title("Search")
+    tender_tab, contract_tab = st.tabs(["Tender notices", "Contracts"])
+    with tender_tab:
+        render_tenders(cur, compact=True)
+    with contract_tab:
+        query = st.text_input("Search contracts", placeholder="Title, organisation, or vendor")
+        results = db.search_contracts(cur, query) if query else db.list_contracts(cur)
+        if not results:
+            st.markdown('<div class="empty-calm">No matching contracts yet.</div>', unsafe_allow_html=True)
+        for contract in results:
+            org = cur.execute("SELECT name FROM organisations WHERE id = ?", (contract["org_id"],)).fetchone()
+            with st.container(border=True):
+                st.markdown(f"### {contract['title']}")
+                st.write(buyer_display_name(org["name"] if org else None))
+                st.write(contract_status_label(contract["status"]))
+                if contract["current_expiry_estimate"]:
+                    st.caption(f"Recorded contract end-date estimate: {contract['current_expiry_estimate']}")
+                if st.button("View contract information", key=f"search_contract_{contract['id']}"):
+                    st.session_state.selected_contract_id = contract["id"]
+                    st.rerun()
+        if st.session_state.selected_contract_id:
+            st.divider()
+            render_contract_detail(cur, st.session_state.selected_contract_id)
 
 elif page == "Tenders":
     cur, conn = get_cursor()

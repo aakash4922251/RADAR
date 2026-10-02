@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import streamlit as st
 
@@ -9,6 +9,140 @@ from acquisition.config import settings as acquisition_settings
 from core.backtesting import backtest_requirement_as_of, evaluate_backtest_results
 from core.proof_packet import build_proof_packet_text
 from db import database as db
+from ui_theme import environment_for_hour
+
+
+def greeting_for_hour(hour: int, name: str = "there") -> str:
+    greeting = "Good morning" if 5 <= hour < 12 else "Good afternoon" if 12 <= hour < 17 else "Good evening"
+    return f"{greeting}, {name}"
+
+
+def evidence_label(confidence: str) -> str:
+    return {"HIGH": "Strong evidence", "MEDIUM": "Growing evidence", "LOW": "Early signal"}.get(
+        (confidence or "").upper(), "Not enough information yet"
+    )
+
+
+def contract_status_label(status: str) -> str:
+    labels = {
+        "CONFLICTING_EVIDENCE": "We found conflicting information",
+        "INSUFFICIENT_EVIDENCE": "Not enough information yet",
+        "HIGH_CONFIDENCE": "Strong supporting evidence",
+        "VERIFIED": "Reviewed information",
+        "NEEDS_REVIEW": "Needs a closer look",
+        "EXPIRED_UNVERIFIED": "May have ended",
+        "EXPIRED": "Recorded end date has passed",
+        "EXTENDED": "Extension recorded",
+        "CANCELLED": "Cancellation recorded",
+        "UNKNOWN": "Status not known yet",
+    }
+    return labels.get(status, "Contract information available")
+
+
+def acquisition_status_label(status: str) -> str:
+    return {
+        "TENDER_EVIDENCE_ONLY": "Notice collected",
+        "DISCOVERED_METADATA_ONLY": "Notice recorded",
+        "MANUAL_ACTION_REQUIRED": "Needs a manual check",
+        "FAILED": "Could not collect document",
+        "DUPLICATE": "Already collected",
+        "PROCESSED": "Notice recorded",
+        "DISCOVERED": "Notice found",
+        "PENDING": "Waiting to collect",
+    }.get(status, "Notice recorded")
+
+
+def buyer_display_name(value: str | None) -> str:
+    if not value:
+        return "Organisation not listed"
+    return " · ".join(part.strip() for part in value.split("||") if part.strip())
+
+
+def format_opportunity_window(start: str | None, end: str | None) -> str:
+    try:
+        start_date = date.fromisoformat(str(start)[:10])
+        end_date = date.fromisoformat(str(end)[:10])
+    except (TypeError, ValueError):
+        return "Expected timing is still being worked out"
+    first = start_date.strftime("%b")
+    last = end_date.strftime("%b")
+    if start_date.year == end_date.year:
+        months = first if first == last else f"{first}-{last}"
+        return f"{months} {end_date.year}"
+    return f"{first} {start_date.year} - {last} {end_date.year}"
+
+
+def opportunity_buckets(opportunity, today: date | None = None) -> set[str]:
+    today = today or date.today()
+    buckets = {"All"}
+    try:
+        predicted = date.fromisoformat(str(opportunity["predicted_date"])[:10])
+        window_start = date.fromisoformat(str(opportunity["window_start"])[:10])
+        window_end = date.fromisoformat(str(opportunity["window_end"])[:10])
+    except (TypeError, ValueError):
+        return buckets | {"Watching"}
+
+    soon_edge = today + timedelta(days=90)
+    if window_end >= today and window_start <= soon_edge:
+        buckets.add("Coming Soon")
+    else:
+        buckets.add("Watching")
+
+    observed = opportunity["latest_tender_date"] if "latest_tender_date" in opportunity.keys() else None
+    if observed:
+        try:
+            observed_date = date.fromisoformat(str(observed)[:10])
+            if today - timedelta(days=14) <= observed_date <= today:
+                buckets.add("New")
+        except ValueError:
+            pass
+    return buckets
+
+
+def human_age(value: str | None, now: datetime | None = None) -> str:
+    if not value:
+        return "No scan recorded yet"
+    try:
+        then = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        current = now or datetime.now().astimezone()
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=current.tzinfo)
+        minutes = max(0, int((current - then).total_seconds() // 60))
+    except (ValueError, TypeError):
+        return "Last scan time unavailable"
+    if minutes < 1:
+        return "Just checked"
+    if minutes < 60:
+        return f"Checked {minutes} min ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"Checked {hours} hr ago"
+    days = hours // 24
+    return f"Checked {days} day{'s' if days != 1 else ''} ago"
+
+
+def timestamp_is_recent(value: str | None, *, within_hours: int = 24, now: datetime | None = None) -> bool:
+    if not value:
+        return False
+    try:
+        then = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        current = now or datetime.now().astimezone()
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=current.tzinfo)
+        age = (current - then).total_seconds()
+        return 0 <= age <= within_hours * 3600
+    except (ValueError, TypeError):
+        return False
+
+
+def history_timeline_years(event_dates: list[str], current_year: int | None = None) -> list[str]:
+    current_year = current_year or date.today().year
+    observed_years = sorted({str(value)[:4] for value in event_dates if value and len(str(value)) >= 4})
+    years = observed_years[-4:]
+    this_year = str(current_year)
+    if this_year not in years:
+        years.append(this_year)
+    return years
 
 
 def _opportunities(cur):
@@ -17,7 +151,16 @@ def _opportunities(cur):
               r.org_id, o.name AS org_name,
               COALESCE((SELECT alias_text FROM requirement_aliases a
                     WHERE a.requirement_id = r.id
-                    ORDER BY a.created_at DESC, a.id DESC LIMIT 1), r.normalized_title) AS display_title
+                    ORDER BY a.created_at DESC, a.id DESC LIMIT 1), r.normalized_title) AS display_title,
+              (SELECT MAX(pe.event_date) FROM procurement_events pe
+                    JOIN requirement_event_links rel ON rel.event_id = pe.id
+                    WHERE rel.requirement_id = r.id
+                      AND pe.discovered_record_id IS NOT NULL) AS latest_tender_date,
+              (SELECT dr.location FROM procurement_events pe
+                    JOIN requirement_event_links rel ON rel.event_id = pe.id
+                    JOIN discovered_records dr ON dr.id = pe.discovered_record_id
+                    WHERE rel.requirement_id = r.id AND dr.location IS NOT NULL
+                    ORDER BY pe.event_date DESC LIMIT 1) AS observed_location
            FROM procurement_predictions pp
            JOIN requirements r ON r.id = pp.requirement_id
            LEFT JOIN organisations o ON o.id = r.org_id
@@ -29,100 +172,123 @@ def _opportunities(cur):
 
 def _show_opportunity_detail(cur, opportunity):
     requirement_id = opportunity["requirement_id"]
-    if st.button("Back to opportunities", icon=":material/arrow_back:"):
+    if st.button("Back to Radar", icon=":material/arrow_back:"):
         st.session_state.selected_requirement_id = None
         st.rerun()
 
     organisation = opportunity["org_name"] or "Organisation not resolved"
-    st.markdown('<div class="eyebrow">Re-opportunity signal</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">A possible repeat procurement</div>', unsafe_allow_html=True)
     st.title(opportunity["display_title"])
-    latest_location = cur.execute(
-        """SELECT dr.location FROM procurement_events pe
-           JOIN requirement_event_links rel ON rel.event_id = pe.id
-           JOIN discovered_records dr ON dr.id = pe.discovered_record_id
-           WHERE rel.requirement_id = ? AND dr.location IS NOT NULL
-           ORDER BY pe.event_date DESC LIMIT 1""",
-        (requirement_id,),
-    ).fetchone()
-    location = latest_location["location"] if latest_location else opportunity["location"]
+    location = opportunity["observed_location"] or opportunity["location"]
     st.caption(f"{organisation} · {location or 'Location not exposed'}")
 
     stats = db.get_latest_cycle(cur, requirement_id)
     events = db.list_events_for_requirement(cur, requirement_id)
-    metrics = st.columns(4)
-    metrics[0].metric("Expected window", f"{opportunity['window_start']} → {opportunity['window_end']}")
-    metrics[1].metric("Expected date", opportunity["predicted_date"])
-    metrics[2].metric("Confidence", opportunity["confidence"])
-    metrics[3].metric("Observed tenders", sum(1 for event in events if event["discovered_record_id"] is not None))
+    top = st.columns([3, 1.2])
+    top[0].markdown("**Expected opportunity**")
+    top[0].markdown(f"<div class='page-title'>{format_opportunity_window(opportunity['window_start'], opportunity['window_end'])}</div>", unsafe_allow_html=True)
+    label = evidence_label(opportunity["confidence"])
+    tone = "strong" if opportunity["confidence"] == "HIGH" else "medium" if opportunity["confidence"] == "MEDIUM" else "early"
+    top[1].markdown(f"<span class='evidence-{tone}'>{label}</span>", unsafe_allow_html=True)
 
-    st.subheader("Why this was flagged")
+    st.subheader("Why did we find this?")
     reasons = []
+    tender_events = [event for event in events if event["discovered_record_id"] is not None and event["event_date"]]
+    if tender_events:
+        reasons.append("A similar procurement has appeared before.")
+    else:
+        reasons.append("This requirement is linked to procurement evidence.")
     if stats and stats["median_interval_days"] is not None:
-        reasons.append(f"Historical cycle measured at a median of {stats['median_interval_days']:.0f} days.")
-        reasons.append(f"{stats['n_cycles']} dated {stats['anchor_event_type']} observations support the estimate.")
-        if stats["stddev_interval_days"] is not None:
-            reasons.append(f"Observed interval standard deviation is {stats['stddev_interval_days']:.1f} days.")
+        years = stats["median_interval_days"] / 365.25
+        months = round(stats["median_interval_days"] / 30.4375)
+        if .8 <= years <= 1.2:
+            interval_text = "around the same time each year"
+        elif months >= 2:
+            interval_text = f"about every {months} months"
+        elif months == 1:
+            interval_text = "about once a month"
+        else:
+            interval_text = f"about every {round(stats['median_interval_days'])} days"
+        reasons.append(f"We found {len(tender_events)} past procurements for this need.")
+        reasons.append(f"They appeared {interval_text}.")
+        today = date.today()
+        try:
+            start = date.fromisoformat(opportunity["window_start"][:10])
+            end = date.fromisoformat(opportunity["window_end"][:10])
+            if end >= today and start <= today + timedelta(days=90):
+                reasons.append("The expected time is getting close.")
+        except (TypeError, ValueError):
+            pass
     else:
-        reasons.append("The requirement has insufficient dated history for a measured cycle.")
-    reasons.append("The window is an inference from observed procurement dates, not a confirmed future tender.")
+        reasons.append("There is not enough past activity to measure timing yet.")
+    if tender_events:
+        newest_event = max(tender_events, key=lambda event: event["event_date"])
+        try:
+            window_start = date.fromisoformat(opportunity["window_start"][:10])
+            window_end = date.fromisoformat(opportunity["window_end"][:10])
+            if newest_event["event_date"] < window_start.isoformat() and date.today() <= window_end:
+                reasons.append("No tender has been recorded in this expected window yet.")
+        except (TypeError, ValueError):
+            pass
     for reason in reasons:
-        st.markdown(f"<div class='signal-row'><span class='signal-check'>✓</span>{reason}</div>", unsafe_allow_html=True)
+        st.markdown(f"✓ {reason}")
+    st.caption("This is an estimate from past activity, not a confirmed tender.")
 
-    st.subheader("Procurement timeline")
+    st.subheader("Procurement history")
     dated_events = sorted((event for event in events if event["event_date"]), key=lambda event: event["event_date"])
+    tender_years = [event["event_date"] for event in dated_events if event["discovered_record_id"] is not None]
+    timeline_years = history_timeline_years(tender_years)
+    this_year = str(date.today().year)
+    if timeline_years:
+        columns = st.columns(len(timeline_years))
+        for index, year in enumerate(timeline_years):
+            observed = any(value.startswith(year) for value in tender_years)
+            with columns[index]:
+                st.markdown(f"<div class='timeline-date'>{year}</div>", unsafe_allow_html=True)
+                st.markdown("●" if observed else "◉" if year == this_year else "—")
+                st.caption("Tender seen" if observed else "Now" if year == this_year else "No record")
     if dated_events:
-        timeline = st.columns(min(len(dated_events), 4))
-        for index, event in enumerate(dated_events):
-            with timeline[index % len(timeline)]:
-                st.markdown(f"<div class='timeline-date'>{event['event_date']}</div>", unsafe_allow_html=True)
-                st.caption(event["event_type"].replace("_", " ").title())
-    else:
-        st.info("No dated procurement observations are linked yet.")
-
-    st.subheader("Evidence trail")
-    for event in events:
-        link = cur.execute(
-            "SELECT match_status, match_score, match_evidence FROM requirement_event_links WHERE requirement_id = ? AND event_id = ?",
-            (requirement_id, event["id"]),
-        ).fetchone()
-        with st.expander(f"{event['event_date'] or 'Undated'} · {event['event_type'].replace('_', ' ').title()}"):
+        for event in reversed(dated_events[-5:]):
+            event_type = event["event_type"].replace("_", " ").title()
+            tender = None
             if event["discovered_record_id"] is not None:
                 tender = cur.execute(
-                    "SELECT external_id, title, organisation, detail_url, source_page_url FROM discovered_records WHERE id = ?",
+                    "SELECT external_id, title, detail_url FROM discovered_records WHERE id = ?",
                     (event["discovered_record_id"],),
                 ).fetchone()
-                if tender:
-                    st.write(f"Tender reference: {tender['external_id']}")
-                    st.write(tender["title"] or "Title unavailable")
-                    if tender["detail_url"]:
-                        st.link_button("Official tender record", tender["detail_url"], icon=":material/open_in_new:")
-                    if tender["source_page_url"]:
-                        st.link_button("Source listing", tender["source_page_url"], icon=":material/open_in_new:")
-                    attached = cur.execute(
-                        "SELECT filename, document_url, status, sha256 FROM acquired_documents WHERE record_id = ? ORDER BY id",
-                        (event["discovered_record_id"],),
-                    ).fetchall()
-                    for document in attached:
-                        st.write(
-                            f"{document['filename'] or 'Tender document'} · {document['status']} · "
-                            f"SHA-256: {document['sha256'] or 'not available'}"
-                        )
-                        st.link_button("Open tender document", document["document_url"], icon=":material/description:")
-            if event["document_id"] is not None:
-                document = db.get_document(cur, event["document_id"])
-                if document:
-                    st.write(f"Contract evidence: {document['doc_title'] or document['doc_type']}")
-                    if document["source_url"]:
-                        st.link_button("Open source document", document["source_url"], icon=":material/open_in_new:")
+            st.markdown(f"**{event['event_date']} · {event_type}**")
+            if tender:
+                st.write(tender["title"] or "Tender title not available")
+                if tender["detail_url"]:
+                    st.link_button("View official notice", tender["detail_url"], icon=":material/open_in_new:")
+    else:
+        st.info("No dated procurement history is available yet.")
+
+    with st.expander("Evidence and advanced details"):
+        st.write(f"Observed cycle: {stats['median_interval_days']:.0f} days" if stats and stats["median_interval_days"] is not None else "Cycle: not measured")
+        st.write(f"Evidence level: {label}")
+        for event in events:
+            link = cur.execute(
+                "SELECT match_status, match_score, match_evidence FROM requirement_event_links WHERE requirement_id = ? AND event_id = ?",
+                (requirement_id, event["id"]),
+            ).fetchone()
             if link:
-                st.write(f"Requirement identity: {link['match_status']} · score {link['match_score']:.2f}")
+                st.write(f"{event['event_date'] or 'Undated'} · {event['event_type'].replace('_', ' ').title()} · match score {link['match_score']:.2f}")
                 st.json(json.loads(link["match_evidence"]))
+            if event["discovered_record_id"] is not None:
+                docs = cur.execute(
+                    "SELECT filename, document_url, sha256 FROM acquired_documents WHERE record_id = ? ORDER BY id",
+                    (event["discovered_record_id"],),
+                ).fetchall()
+                for document in docs:
+                    st.write(f"{document['filename'] or 'Tender document'} · SHA-256 {document['sha256'] or 'not available'}")
+                    st.link_button("Open source document", document["document_url"], icon=":material/description:")
 
 
 def render_opportunities(cur):
     st.markdown('<div class="eyebrow">Procurement intelligence</div>', unsafe_allow_html=True)
-    st.title("Re-opportunity radar")
-    st.caption("Potential recurring procurements inferred from dated history. This is not a guarantee that a tender will be issued.")
+    st.title("Radar")
+    st.caption("What should I pay attention to?")
     opportunities = _opportunities(cur)
     selected_id = st.session_state.get("selected_requirement_id")
     selected = next((row for row in opportunities if row["requirement_id"] == selected_id), None)
@@ -130,71 +296,90 @@ def render_opportunities(cur):
         _show_opportunity_detail(cur, selected)
         return
 
-    search = st.text_input("Find an opportunity", placeholder="Requirement, organisation, or service")
-    confidence_filter = st.selectbox("Evidence confidence", ["All", "HIGH", "MEDIUM", "LOW"])
-    filtered = [row for row in opportunities if
-                (confidence_filter == "All" or row["confidence"] == confidence_filter)
-                and (not search or search.lower() in " ".join(str(row[key] or "") for key in ("display_title", "normalized_title", "org_name", "asset_keyword")).lower())]
-    if not filtered:
-        st.info("No matching opportunities. A requirement needs at least two dated procurement observations before a cycle can be estimated.")
-        if st.button("Review tenders", icon=":material/description:"):
-            st.session_state.active_page = "Tenders"
-            st.rerun()
-        return
-
-    for offset in range(0, len(filtered), 2):
-        columns = st.columns(2)
-        for column, opportunity in zip(columns, filtered[offset:offset + 2]):
-            with column:
+    selected_tab = st.session_state.get("radar_tab", "All")
+    tabs = st.tabs(["All", "New", "Coming Soon", "Watching"])
+    for tab_name, tab in zip(("All", "New", "Coming Soon", "Watching"), tabs):
+        with tab:
+            subset = [row for row in opportunities if tab_name in opportunity_buckets(row)]
+            if not subset:
+                st.markdown('<div class="empty-calm">🌤️ Everything looks calm.</div>', unsafe_allow_html=True)
+                st.write("Your radar is still watching government procurement.")
+                if st.button("See recent tenders", key=f"empty_tenders_{tab_name}", icon=":material/description:"):
+                    st.session_state.active_page = "Tenders"
+                    st.rerun()
+                continue
+            for opportunity in subset:
                 with st.container(border=True):
-                    st.write(opportunity["display_title"])
-                    st.caption(f"{opportunity['org_name'] or 'Organisation not resolved'} · {opportunity['asset_keyword']}")
+                    st.markdown(f"### {opportunity['display_title']}")
+                    location = opportunity["observed_location"] or opportunity["location"]
+                    buyer_line = opportunity["org_name"] or "Organisation not listed"
+                    if location:
+                        buyer_line += f" · {location}"
+                    st.write(buyer_line)
                     st.markdown(
-                        f"<span class='opportunity-window'>Expected · {opportunity['window_start']} to {opportunity['window_end']}</span>",
-                        unsafe_allow_html=True,
+                        f"**Expected opportunity** · {format_opportunity_window(opportunity['window_start'], opportunity['window_end'])}"
                     )
-                    stats = db.get_latest_cycle(cur, opportunity["requirement_id"])
-                    cycle = f"{stats['median_interval_days']:.0f} day median" if stats and stats["median_interval_days"] is not None else "Cycle unavailable"
-                    st.write(f"{cycle} · {opportunity['confidence']} evidence confidence")
-                    if st.button("View signal", key=f"open_opportunity_{opportunity['requirement_id']}", icon=":material/arrow_forward:"):
+                    st.markdown(f"<span class='evidence-{('strong' if opportunity['confidence'] == 'HIGH' else 'medium' if opportunity['confidence'] == 'MEDIUM' else 'early')}'>{evidence_label(opportunity['confidence'])}</span>", unsafe_allow_html=True)
+                    if st.button(
+                        "View opportunity",
+                        key=f"open_opportunity_{tab_name}_{opportunity['requirement_id']}",
+                        icon=":material/arrow_forward:",
+                    ):
                         st.session_state.selected_requirement_id = opportunity["requirement_id"]
                         st.rerun()
 
 
-def render_tenders(cur):
-    st.markdown('<div class="eyebrow">Official-source observations</div>', unsafe_allow_html=True)
-    st.title("Tenders")
-    st.caption("Tender notices and their source documents are tracked independently from contract records.")
+def render_tenders(cur, compact: bool = False):
+    if not compact:
+        st.markdown('<div class="eyebrow">Official-source observations</div>', unsafe_allow_html=True)
+        st.title("Tender notices")
     records = db.list_discovered_records(cur, limit=500)
-    query = st.text_input("Search tenders", placeholder="Title, reference, organisation, or location")
-    status_values = ["All statuses"] + sorted({record["acquisition_status"] for record in records})
-    status = st.selectbox("Acquisition status", status_values)
+    query = st.text_input("Search tender notices", placeholder="Tender, organisation, or place", key="compact_tender_search" if compact else "tender_search")
+    status = "All statuses"
+    if not compact:
+        status_values = ["All statuses"] + sorted({record["acquisition_status"] for record in records})
+        status = st.selectbox("Show", status_values)
     filtered = [record for record in records if
                 (status == "All statuses" or record["acquisition_status"] == status)
                 and (not query or query.lower() in " ".join(str(record[key] or "") for key in ("title", "external_id", "organisation", "location")).lower())]
-    st.caption(f"{len(filtered)} tender record(s)")
+    st.caption(f"{len(filtered)} notice(s) found")
     if not filtered:
-        st.info("No tender records match these filters.")
+        st.info("No notices match that search.")
         return
-    for record in filtered:
+    visible_records = filtered[:10] if compact else filtered
+    if compact and len(filtered) > len(visible_records):
+        st.caption("Showing the 10 most recent notices. Use More → Tenders for filters and the full list.")
+    for record in visible_records:
         title = record["title"] or record["external_id"]
-        with st.expander(f"{title} · {record['external_id']} · {record['acquisition_status']}"):
-            fields = st.columns(4)
-            fields[0].write(f"Organisation\n\n{record['organisation'] or 'Not exposed'}")
-            fields[1].write(f"Location\n\n{record['location'] or 'Not exposed'}")
-            fields[2].write(f"Published\n\n{record['published_at'] or 'Not exposed'}")
-            fields[3].write(f"Closing\n\n{record['closing_at'] or 'Not exposed'}")
+        buyer = buyer_display_name(record["organisation"])
+        place = record["location"] or "Place not listed"
+        date_text = record["published_at"] or record["closing_at"] or "Date not listed"
+        if compact:
+            st.markdown(f"**{title}**")
+            st.write(f"{buyer} · {place}")
+            st.caption(f"{date_text} · {acquisition_status_label(record['acquisition_status'])}")
             if record["detail_url"]:
-                st.link_button("Official tender record", record["detail_url"], icon=":material/open_in_new:")
-            documents = cur.execute(
-                "SELECT filename, document_url, status, sha256 FROM acquired_documents WHERE record_id = ? ORDER BY id",
-                (record["id"],),
-            ).fetchall()
-            if documents:
-                st.write("Acquired tender documents")
-                for document in documents:
-                    st.write(f"{document['filename'] or 'Document'} · {document['status']} · SHA-256 {document['sha256'] or 'pending'}")
-                    st.link_button("Open document source", document["document_url"], icon=":material/description:")
+                st.link_button("Official notice", record["detail_url"], icon=":material/open_in_new:", key=f"compact_tender_{record['id']}")
+            st.divider()
+            continue
+
+        st.markdown(f"### {title}")
+        st.write(f"{buyer} · {place}")
+        st.caption(f"{date_text} · {acquisition_status_label(record['acquisition_status'])}")
+        if record["detail_url"]:
+            st.link_button("Official notice", record["detail_url"], icon=":material/open_in_new:")
+        documents = cur.execute(
+            "SELECT filename, document_url, status, sha256 FROM acquired_documents WHERE record_id = ? ORDER BY id",
+            (record["id"],),
+        ).fetchall()
+        with st.expander("More notice details"):
+            st.write(f"Reference: {record['external_id']}")
+            st.write(f"Published: {record['published_at'] or 'Not listed'} · Closing: {record['closing_at'] or 'Not listed'}")
+            st.write(f"Tender value: {record['estimated_value'] or 'Not listed'}")
+            for document in documents:
+                file_state = "Collected" if document["status"] in {"DOWNLOADED", "PROCESSED", "DUPLICATE"} else acquisition_status_label(document["status"])
+                st.write(f"{document['filename'] or 'Tender document'} · {file_state}")
+                st.link_button("Open source document", document["document_url"], icon=":material/description:")
             linked_events = cur.execute(
                 """SELECT pe.event_date, rel.requirement_id
                    FROM procurement_events pe
@@ -202,12 +387,10 @@ def render_tenders(cur):
                    WHERE pe.discovered_record_id = ?""",
                 (record["id"],),
             ).fetchall()
-            if linked_events:
-                st.write("Linked requirement history")
-                for event in linked_events:
-                    requirement = db.get_requirement(cur, event["requirement_id"]) if event["requirement_id"] else None
-                    if requirement:
-                        st.write(f"{event['event_date']} · {requirement['normalized_title']}")
+            for event in linked_events:
+                requirement = db.get_requirement(cur, event["requirement_id"]) if event["requirement_id"] else None
+                if requirement:
+                    st.write(f"Similar requirement: {requirement['normalized_title']} · {event['event_date']}")
 
 
 def render_organisations(cur):
@@ -359,30 +542,42 @@ def render_sources(cur):
 
 
 def render_alerts(cur):
-    st.markdown('<div class="eyebrow">Items requiring attention</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">Things that may need you</div>', unsafe_allow_html=True)
     st.title("Alerts")
     manual = db.list_discovered_records(cur, acquisition_status="MANUAL_ACTION_REQUIRED")
     queue = db.list_review_queue(cur)
-    first, second = st.columns(2)
-    first.metric("Manual source actions", len(manual))
-    second.metric("Contracts for review", len(queue))
-    st.subheader("Source access or document blocks")
+    if not manual and not queue:
+        st.markdown('<div class="empty-calm">You\'re all caught up.</div>', unsafe_allow_html=True)
+        st.write("Your radar will show items here when something needs a closer look.")
+        return
+
     if manual:
-        st.dataframe([
-            {"Tender": row["title"] or row["external_id"], "Organisation": row["organisation"] or "Unknown",
-             "Reason": row["last_error"] or "Manual retrieval required", "Detail page": row["detail_url"] or "Not available"}
-            for row in manual
-        ], use_container_width=True, hide_index=True)
-    else:
-        st.success("No tender records currently require manual source action.")
-    st.subheader("Contract evidence review")
+        st.subheader("Official source needs a check")
+        for row in manual:
+            title = row["title"] or row["external_id"]
+            with st.container(border=True):
+                st.markdown(f"### {title}")
+                st.write(row["organisation"] or "Organisation not listed")
+                reason = row["last_error"] or "The source needs a manual check before this item can be collected."
+                lowered = reason.lower()
+                friendly_reason = "The official site asked for a person to continue." if "captcha" in lowered else "The document could not be collected automatically." if "auth" in lowered or "blocked" in lowered else "This source item needs a quick manual check."
+                st.write(friendly_reason)
+                with st.expander("Advanced details"):
+                    st.write(reason)
+                    st.write(row["detail_url"] or "No detail page was supplied by the source.")
+                if row["detail_url"]:
+                    st.link_button("Open official notice", row["detail_url"], icon=":material/open_in_new:")
+
     if queue:
-        st.dataframe([
-            {"Contract": row["title"], "Status": row["status"], "Expiry": row["current_expiry_estimate"] or "Unknown"}
-            for row in queue
-        ], use_container_width=True, hide_index=True)
-    else:
-        st.success("No contract evidence conflicts are waiting for review.")
+        st.subheader("Contract information needs review")
+        for contract in queue:
+            with st.container(border=True):
+                st.markdown(f"### {contract['title']}")
+                st.write(contract_status_label(contract["status"]))
+                if st.button("Review information", key=f"alert_review_{contract['id']}"):
+                    st.session_state.selected_contract_id = contract["id"]
+                    st.session_state.active_page = "Contract Search"
+                    st.rerun()
 
 
 def render_analytics(cur):
