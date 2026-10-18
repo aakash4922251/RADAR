@@ -78,6 +78,49 @@ _PUBLIC = """
 [data-testid="stSidebar"] { display: none; }
 [data-testid="stAppViewContainer"] > .main { padding-left: 0; }
 [data-testid="stMainBlockContainer"] { max-width: 880px; padding: 2.4rem 1.5rem 4rem; margin: 0 auto; }
+
+/* Ambient background: a slow drifting gradient plus a few soft blurred
+   shapes. Both re-tint via :has() off the evidence pill that's already in
+   the result card's markup — no Python state-wiring needed. The blobs pick
+   up a faster circular orbit for as long as a st.spinner is on the page,
+   so the background itself reads as "working" instead of a generic spinner. */
+[data-testid="stAppViewContainer"] {
+    --aurora-1: #eef4fb; --aurora-2: #e3edf8; --aurora-3: #f4f9fd; --aurora-4: #e9f1f9;
+    --blob-tint: #bcd7f5;
+    background: linear-gradient(120deg, var(--aurora-1), var(--aurora-2), var(--aurora-3), var(--aurora-4));
+    background-size: 320% 320%;
+    animation: aurora-drift 26s ease-in-out infinite;
+    transition: background-color .8s ease;
+}
+[data-testid="stAppViewContainer"]:has(.evidence-strong) {
+    --aurora-1: #e9fbf1; --aurora-2: #ddf6e8; --aurora-3: #f2fcf7; --aurora-4: #e2f8ec; --blob-tint: #a7e6c4;
+}
+[data-testid="stAppViewContainer"]:has(.evidence-medium) {
+    --aurora-1: #fff6e6; --aurora-2: #fdefd3; --aurora-3: #fffaf0; --aurora-4: #fcf0d6; --blob-tint: #f2cd86;
+}
+@keyframes aurora-drift {
+    0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; }
+}
+.bg-blob {
+    position: fixed; z-index: -1; pointer-events: none; border-radius: 50%;
+    filter: blur(70px); opacity: .4; will-change: transform;
+    background: radial-gradient(circle, var(--blob-tint, #bcd7f5) 0%, transparent 72%);
+    animation: blob-drift 25s ease-in-out infinite;
+}
+.blob-1 { width: 340px; height: 340px; top: -90px; left: -70px; animation-duration: 23s; }
+.blob-2 { width: 280px; height: 280px; bottom: -70px; right: -50px; animation-duration: 29s; animation-delay: -8s; }
+.blob-3 { width: 230px; height: 230px; top: 38%; right: 12%; animation-duration: 26s; animation-delay: -14s; }
+@keyframes blob-drift {
+    0% { transform: translate(0, 0) scale(1); } 33% { transform: translate(26px, -20px) scale(1.07); }
+    66% { transform: translate(-18px, 18px) scale(.95); } 100% { transform: translate(0, 0) scale(1); }
+}
+[data-testid="stAppViewContainer"]:has([data-testid="stSpinner"]) .bg-blob {
+    animation-name: blob-orbit; animation-duration: 3.4s; animation-timing-function: linear;
+}
+@keyframes blob-orbit {
+    0% { transform: rotate(0deg) translateX(30px) rotate(0deg) scale(1); }
+    100% { transform: rotate(360deg) translateX(30px) rotate(-360deg) scale(1); }
+}
 .brand-row { display: flex; align-items: center; gap: .6rem; margin-bottom: 1.6rem; }
 .brand-mark { width: 34px; height: 34px; border-radius: 9px; background: linear-gradient(135deg, var(--navy), var(--blue));
               display: inline-flex; align-items: center; justify-content: center; color: #fff; font-weight: 800; font-size: 1.1rem; }

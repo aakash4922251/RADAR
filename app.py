@@ -39,6 +39,10 @@ cur, conn = get_cursor()
 st.session_state.setdefault("my_contract_ids", [])  # this session's own contracts, most recent first
 
 st.markdown(
+    '<div class="bg-blob blob-1"></div><div class="bg-blob blob-2"></div><div class="bg-blob blob-3"></div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
     '<div class="brand-row"><span class="brand-mark">CE</span>'
     '<span class="brand-name">Contract Expiry Radar</span></div>',
     unsafe_allow_html=True,
