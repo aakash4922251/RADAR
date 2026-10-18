@@ -1,0 +1,11 @@
+# Native-widget colors before our own CSS loads; app.py/pages override most
+# of this with their own styling (see ui_theme.py).
+[theme]
+primaryColor = "#2876b8"
+backgroundColor = "#f5f8fb"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#18304a"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

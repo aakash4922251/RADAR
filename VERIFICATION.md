@@ -1,8 +1,51 @@
 # Verification — what was run, and what was not
 
-Last run: 2026-10-18, Windows 11, Python 3.14, Streamlit 1.64, Tesseract 5.4.
+Last run: 2026-10-19, Windows 11, Python 3.14, Streamlit 1.64, Tesseract 5.4.
 
-## Verified
+## Public/internal split and deployment package — 2026-10-19
+
+* `python -m pytest`: still **85 passed** (this round only touched `app.py`, the new
+  `pages/01_Internal_Dashboard.py`, `ui_theme.py`, `ui_shared.py` — no `core`/`db` logic
+  changed).
+* Both pages driven end-to-end under real Streamlit (`AppTest`), against a real tracked
+  document and a real backup/restore cycle, not just a page load:
+  - **Public page**, empty session → upload one award letter → a result card renders
+    with the correct computed end date and an evidence pill; no exceptions.
+  - **Internal page**: no `ADMIN_PASSWORD` set → locked for everyone with a clear
+    message, no password box offered at all (fails closed, not open). Wrong password
+    → rejected. Correct password → full portfolio (every contract from every session,
+    confirming the public page's one-session-only view is a real boundary, not just
+    hidden UI) with correct KPI counts; opening a contract renders all three detail
+    tabs and the Proof Packet.
+  - **Backup**: produced real, non-empty bytes via SQLite's own `backup()` API (safe
+    under WAL mode).
+  - **Restore**: two real bugs were caught by testing the destructive path, not just
+    the happy path, and both are fixed and re-verified:
+    1. Uploading a non-database file crashed the whole page with an uncaught
+       `sqlite3.DatabaseError` instead of a friendly message — now caught and shown
+       as an error, live data left untouched.
+    2. Replacing the live database file raised `PermissionError: file ... being used
+       by another process` on Windows (a stale Python traceback object kept the old
+       SQLite connection's file handle alive past `.close()`) — fixed with an explicit
+       `gc.collect()` plus a short bounded retry before deleting/replacing files.
+    After the fix: a valid backup file restores cleanly, the session stays logged in
+    (no re-login forced by a data change), and the live `.db` on disk was independently
+    opened afterward and confirmed to have the full correct schema and the restored
+    (zero) contract count — not just "no exception raised".
+* `ADMIN_PASSWORD` lookup checks `os.environ` then falls back to `st.secrets`, so it
+  works however Streamlit Community Cloud exposes a Secrets-panel value, without
+  betting on one specific undocumented-to-us behavior.
+
+NOT verified: an actual Streamlit Community Cloud deployment (no account exists to
+deploy to from this session — the steps in README → Deploy are correct to the best
+of available knowledge but untested live); a real external Postgres/Neon database
+(no live instance was reachable from this sandbox — no driver, no local server, and
+Docker is installed but its engine isn't running here) — the backup/restore feature
+above is the verified fix for data durability in this build, not a database swap.
+
+## Previous round
+
+
 
 * `python -m pytest`: **85 passed.** Real documents under `tests/fixtures/` pin each fix:
 

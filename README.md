@@ -7,15 +7,63 @@ Accepted: tender notices (NIT), CPPP tender/award pages, award letters (LOA/AOC)
 work orders, agreements, corrigenda and extension orders, as digital PDFs,
 scanned PDFs, phone photos, Word, Excel, text, or a ZIP of these.
 
-## Run it
+## Two pages, one app
+
+| Page | URL | Who | What they see |
+|---|---|---|---|
+| **Public** | `/` (app.py) | Anyone with the link | A single upload box and their own results only — one browser session never sees what another session uploaded. No internal detail (extraction rules, raw document text, delete controls). |
+| **Internal Dashboard** | `/Internal_Dashboard` | You, behind a password | Every contract from everyone, the full evidence breakdown, conflict resolution, contract removal, and database backup/restore. |
+
+The public page never links to the internal one (its sidebar is hidden), so visitors
+don't know it exists; the password is what actually protects it, not the hidden link.
+
+## Run it locally
 
 ```bash
 python -m pip install -r requirements.txt
 winget install UB-Mannheim.TesseractOCR   # once, for scans and photos (Linux: apt-get install tesseract-ocr)
+$env:ADMIN_PASSWORD = "pick-something"    # bash/Linux/macOS: export ADMIN_PASSWORD=pick-something
 streamlit run app.py
 ```
 
 Tests: `python -m pytest`
+
+## Deploy it (free, ~5 minutes) — Streamlit Community Cloud
+
+1. Push this repo to GitHub (already done if you're reading this from the repo).
+2. Go to **share.streamlit.io**, sign in with GitHub, click **New app**.
+3. Pick this repo, branch `main`, main file `app.py`. Deploy.
+4. Before (or right after) it finishes building, open **Settings → Secrets** on the
+   app and add:
+   ```
+   ADMIN_PASSWORD = "pick-something-only-you-know"
+   ```
+   Without this, the internal dashboard stays locked for everyone, including you.
+5. `packages.txt` (already in the repo) tells Streamlit Cloud to install Tesseract,
+   so OCR for scans and photos works on the deployed app too — nothing else to do.
+
+Your repo stays the source of truth: redeploying (a new `git push`) always rebuilds
+from GitHub, so your *code* is never at risk. What free hosts generally do **not**
+guarantee is that the app's local disk — where the SQLite database lives — survives
+a restart. That's what the next section is for.
+
+### Storage: don't lose uploaded contracts
+
+Streamlit Cloud (and most free hosts) can restart your app's container — after
+inactivity, a redeploy, or routine maintenance — and the local filesystem may come
+back empty when that happens. Your *code* is always safe (it's rebuilt from this
+Git repo); what's at risk is the *data* — every contract anyone has uploaded.
+
+The fix that ships in this repo: open the **internal dashboard → Database backup**,
+click **Prepare a backup**, then **Download backup** — it's one `.db` file. If the
+live app ever comes back with zero contracts, upload that same file back in under
+**Restore from a backup file** and confirm. Get in the habit of backing up after a
+batch of real uploads.
+
+If you'd rather this happen automatically with no restart ever losing anything, the
+real fix is an external database instead of a local file (e.g. a free Postgres on
+neon.tech or supabase.com) — that's a larger change than this build includes today;
+ask for it if you want it built out.
 
 ## What it tells you
 
