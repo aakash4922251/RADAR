@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +22,10 @@ from core import pipeline
 from core.procurement_intelligence import process_bytes, process_zip, process_directory, fetch_and_process_url, init_intelligence_tables
 from core.dataset_import import DEFAULT_REPO, DatasetAsset, inspect_github_dataset, download_asset, register_imported_dataset, query_imported_dataset, duckdb_available, find_historical_aoc_root
 from core.proof_packet import build_proof_packet_text
+from core.brief_pdf import build_buyer_brief, format_inr
+from core.contract_expiry import details_root
+from core.contract_tracker import portfolio, reread_all, track_documents
+from core.ingestion import SUPPORTED_EXTENSIONS as UPLOAD_EXTENSIONS, ocr_available
 from acquisition.config import settings as acquisition_settings
 from acquisition.http import PublicHttpClient
 from acquisition.registry import get_connector
@@ -51,9 +56,28 @@ db.init_db()  # idempotent — creates tables if they don't exist
 apply_theme()
 
 
+def close_page_connections():
+    """Roll back and close every connection a page run opened. Pages commit
+    what they mean to keep; anything left open would hold SQLite's write lock
+    and block every other session and the background worker."""
+    for conn in st.session_state.get("_db_connections", []):
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+    st.session_state["_db_connections"] = []
+
+
 def get_cursor():
     conn = db.get_connection()
+    st.session_state.setdefault("_db_connections", []).append(conn)
     return conn.cursor(), conn
+
+
+# A run cut short by st.rerun() or an error skips the cleanup at the end of
+# this script, so release whatever the previous run left behind first.
+close_page_connections()
 
 
 STATUS_COLORS = {
@@ -69,6 +93,9 @@ STATUS_COLORS = {
     "CANCELLED": "⚫",
 }
 
+VERIFY_CAPTION = ("Verify any row on the official portal: open [CPPP → Result of Tenders](https://eprocure.gov.in/cppp/resultoftendersnew) and search its Tender ID. Portal links are session-bound and expire, so the app shows the ID instead of a link.")
+
+
 DOC_TYPES = [
     "nit", "bid_document", "corrigendum", "aoc", "loa", "work_order",
     "signed_agreement", "site_handover_letter", "sla_stc",
@@ -80,15 +107,20 @@ DOC_TYPES = [
 # Sidebar navigation
 # ---------------------------------------------------------------------
 PRIMARY_NAV = [
-    ("Home", "Home", ":material/home:"),
-    ("Radar", "Radar", ":material/radar:"),
-    ("Alerts", "Alerts", ":material/notifications:"),
-    ("Search", "Search", ":material/search:"),
-    ("Monitoring", "Monitoring", ":material/sensors:"),
+    ("My contracts", "Tracker", ":material/assignment:"),
+    ("Contracts ending", "Expiry", ":material/event_upcoming:"),
+    ("Buyer profiles", "Buyer", ":material/apartment:"),
+    ("Repeat buyers", "Finder", ":material/travel_explore:"),
+    ("Live tenders", "Monitoring", ":material/sensors:"),
     ("Data Center", "Data Center", ":material/cloud_upload:"),
 ]
 
 MORE_NAV = [
+    ("Add document manually", "Upload Document", ":material/upload_file:"),
+    ("Search", "Search", ":material/search:"),
+    ("Home", "Home", ":material/home:"),
+    ("Radar", "Radar", ":material/radar:"),
+    ("Alerts", "Alerts", ":material/notifications:"),
     ("Tenders", "Tenders", ":material/description:"),
     ("Procurement cycles", "Procurement Cycles", ":material/cycle:"),
     ("Documents", "Documents", ":material/folder_open:"),
@@ -98,7 +130,6 @@ MORE_NAV = [
     ("Backtesting", "Backtesting", ":material/science:"),
     ("Sources", "Sources", ":material/source:"),
     ("Settings", "Settings", ":material/settings:"),
-    ("Upload contract evidence", "Upload Document", ":material/upload_file:"),
     ("Contract search", "Contract Search", ":material/search:"),
     ("Review queue", "Review Queue", ":material/rule:"),
 ]
@@ -111,9 +142,9 @@ def set_active_page(name: str):
 
 
 if "active_page" not in st.session_state:
-    st.session_state.active_page = "Home"
+    st.session_state.active_page = "Tracker"
 elif st.session_state.active_page == "Overview":
-    st.session_state.active_page = "Home"
+    st.session_state.active_page = "Tracker"
 elif st.session_state.active_page == "Opportunities":
     st.session_state.active_page = "Radar"
 elif st.session_state.active_page == "Live Monitor":
@@ -121,7 +152,7 @@ elif st.session_state.active_page == "Live Monitor":
 
 st.sidebar.markdown(
     '<div class="radar-brand">OPPORTUNITY RADAR</div>'
-    '<div class="radar-brand-sub">Government procurement opportunities, made clear</div>',
+    '<div class="radar-brand-sub">Know which government contracts end — before the tender is out</div>',
     unsafe_allow_html=True,
 )
 for label, destination, icon in PRIMARY_NAV:
@@ -130,7 +161,7 @@ for label, destination, icon in PRIMARY_NAV:
         key=f"primary_nav_{destination}",
         icon=icon,
         type="primary" if st.session_state.active_page == destination else "secondary",
-        use_container_width=True,
+        width="stretch",
         on_click=set_active_page,
         args=(destination,),
     )
@@ -142,7 +173,7 @@ with st.sidebar.expander("More", expanded=st.session_state.active_page not in {i
             key=f"more_nav_{destination}",
             icon=icon,
             type="primary" if st.session_state.active_page == destination else "secondary",
-            use_container_width=True,
+            width="stretch",
             on_click=set_active_page,
             args=(destination,),
         )
@@ -152,6 +183,74 @@ page = st.session_state.active_page
 
 def historical_root_path():
     return Path(os.path.dirname(os.path.abspath(__file__))) / "data" / "historical"
+
+
+# The historical scan reads millions of Parquet rows, so results are cached
+# per filter combination and recomputed at most once a day.
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_cycle_signals(root: str, as_of_iso: str, state: str, city: str, keyword: str):
+    # Every requirement still active: next award expected anywhere from two
+    # years ago (often late or extended) to three years ahead.
+    from core.dataset_import import historical_aoc_cycle_signals
+    return historical_aoc_cycle_signals(root, as_of=as_of_iso, horizon_days=1095, overdue_days=730, limit=None,
+                                        state=state, city=city, keyword=keyword)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_backtest(root: str, as_of_iso: str):
+    from core.dataset_import import backtest_aoc_signals
+    return backtest_aoc_signals(root, as_of=as_of_iso, horizon_days=182)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_contracts_ending(root: str, as_of_iso: str, within_days: int, state: str, city: str, keyword: str,
+                            min_value: float):
+    from core.contract_expiry import contracts_ending
+    return contracts_ending(root, as_of=as_of_iso, within_days=within_days, state=state, city=city,
+                            keyword=keyword, min_value_inr=min_value)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_expiry_coverage(root: str):
+    from core.contract_expiry import expiry_coverage
+    return expiry_coverage(root)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_expiry_backtest(root: str):
+    from core.contract_expiry import backtest_contract_expiry
+    results = [backtest_contract_expiry(root, as_of=a) for a in ("2023-07-01", "2024-01-01", "2024-07-01", "2025-01-01")]
+    return [(r["as_of"], r["summary"]) for r in results if not r["summary"].empty]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_search_buyers(root: str, text: str):
+    from core.buyer_intel import search_buyers
+    return search_buyers(root, text)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_buyer_profile(root: str, buyer: str, as_of_iso: str):
+    from core.buyer_intel import buyer_profile
+    return buyer_profile(root, buyer, as_of=as_of_iso)
+
+
+def open_buyer(name: str):
+    st.session_state.buyer_selected = name
+    st.session_state.buyer_search = name
+    st.session_state.active_page = "Buyer"
+
+
+def kpi_row(items):
+    cols = st.columns(len(items))
+    for col, (label, value) in zip(cols, items):
+        col.metric(label, value)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_aoc_stats(root: str):
+    from core.dataset_import import historical_aoc_stats
+    return historical_aoc_stats(root)
 
 
 def get_radar_rows(cur, limit=None):
@@ -308,9 +407,9 @@ if page == "Home":
 
     st.write("")
     home_actions = st.columns([1, 1, 3])
-    if home_actions[0].button("Explore Radar", type="primary", icon=":material/radar:", use_container_width=True):
+    if home_actions[0].button("Explore Radar", type="primary", icon=":material/radar:", width="stretch"):
         set_page_and_rerun("Radar")
-    if home_actions[1].button("Latest activity", icon=":material/history:", use_container_width=True):
+    if home_actions[1].button("Latest activity", icon=":material/history:", width="stretch"):
         set_page_and_rerun("Monitoring")
 
 
@@ -349,7 +448,7 @@ elif page == "Data Center":
                 progress.progress(i/len(uploads))
             ok=sum(r.status=="PROCESSED" for r in results); dup=sum(r.status=="DUPLICATE" for r in results); fail=sum(r.status=="FAILED" for r in results)
             st.success(f"Processed {ok} · skipped {dup} duplicates · {fail} failed")
-            st.dataframe([{"File":r.filename,"Type":r.document_type,"Status":r.status,"Facts":len(r.facts)} for r in results], use_container_width=True, hide_index=True)
+            st.dataframe([{"File":r.filename,"Type":r.document_type,"Status":r.status,"Facts":len(r.facts)} for r in results], width="stretch", hide_index=True)
 
     with tabs[1]:
         st.subheader("Add historical procurement data")
@@ -434,7 +533,7 @@ elif page == "Data Center":
                         if st.button("Run query", key="run_historical_sql"):
                             try:
                                 df = query_imported_dataset(root, q)
-                                st.dataframe(df, use_container_width=True, hide_index=True)
+                                st.dataframe(df, width="stretch", hide_index=True)
                             except Exception as exc:
                                 st.error(str(exc))
 
@@ -451,7 +550,7 @@ elif page == "Data Center":
         rows=conn.execute("SELECT id,filename,document_type,classification_confidence,status,created_at FROM radar_documents ORDER BY id DESC LIMIT 500").fetchall()
         st.metric("Documents in intelligence store", conn.execute("SELECT COUNT(*) FROM radar_documents").fetchone()[0])
         if rows:
-            st.dataframe([dict(r) for r in rows], use_container_width=True, hide_index=True)
+            st.dataframe([dict(r) for r in rows], width="stretch", hide_index=True)
         else:
             st.info("No documents processed yet.")
 
@@ -534,55 +633,476 @@ elif page == "Monitoring":
 # ---------------------------------------------------------------------
 # Radar: dedicated tender and intelligence screens
 # ---------------------------------------------------------------------
+elif page == "Tracker":
+    cur, conn = get_cursor()
+    st.markdown('<div class="eyebrow">Contract tracker</div>', unsafe_allow_html=True)
+    st.title("My contracts")
+    st.markdown(
+        '<div class="page-subtitle">Upload award letters, work orders or agreements — one file, many files or a ZIP. '
+        'Each contract\'s end date is read from the documents themselves, with the exact quote that proves it.</div>',
+        unsafe_allow_html=True,
+    )
+    today = datetime.now().date()
+    book = portfolio(cur, today=today)
+
+    with st.expander("Add documents", expanded=book.empty, icon=":material/upload_file:"):
+        ocr_ready = ocr_available()
+        uploads = st.file_uploader(
+            "Award letters, work orders, agreements, corrigenda — PDF, scans, photos, Word, Excel or a ZIP",
+            type=sorted(ext.lstrip(".") for ext in UPLOAD_EXTENSIONS) + ["zip"],
+            accept_multiple_files=True, key="tracker_uploads",
+        )
+        photo = None
+        if ocr_ready and st.toggle("Take a photo instead", key="tracker_camera",
+                                   help="Use this device's camera. Hold the page flat, fill the frame, avoid glare."):
+            photo = st.camera_input("Photograph the document", key="tracker_camera_input")
+        same = st.checkbox("These files are all about one contract", key="tracker_same",
+                           help="Leave unticked when each file is a different contract. Files that share a "
+                                "CPPP Tender ID or tender reference number are linked automatically.")
+        if not ocr_ready:
+            st.caption("Scanned PDFs and photos need text recognition (OCR), which is not installed on this "
+                       "computer. Digital PDFs, Word, Excel and text files work as they are.")
+        files = [(u.name, u.getvalue()) for u in uploads or []]
+        if photo is not None:
+            files.append((f"photo_{datetime.now():%Y%m%d_%H%M%S}.jpg", photo.getvalue()))
+        if st.button("Add to tracker", type="primary", disabled=not files, icon=":material/add:"):
+            with st.spinner("Reading documents (scans and photos take a few seconds per page)..."):
+                results = track_documents(cur, files, same_contract=same)
+            conn.commit()
+            st.session_state.tracker_last_results = [r.__dict__ for r in results]
+            st.rerun()
+        last = st.session_state.get("tracker_last_results")
+        if last:
+            added = sum(r["status"] == "ADDED" for r in last)
+            st.success(f"{added} document(s) added · {sum(r['status'] == 'ALREADY_TRACKED' for r in last)} already tracked · "
+                       f"{sum(r['status'] in ('FAILED', 'SKIPPED') for r in last)} not read")
+            st.dataframe(pd.DataFrame([{
+                "File": r["filename"], "Result": {"ADDED": "Added", "ALREADY_TRACKED": "Already tracked",
+                                                  "FAILED": "Could not read", "SKIPPED": "Unsupported"}[r["status"]],
+                "Contract": r["contract_title"] or "", "Ends on": r["end_date"] or "Not found in document",
+                "Note": r["message"],
+            } for r in last]), width="stretch", hide_index=True)
+
+    if book.empty:
+        st.markdown('<div class="empty-calm">No contracts tracked yet.</div>', unsafe_allow_html=True)
+        st.write("Add an award letter or work order above to see its end date and the evidence behind it.")
+    else:
+        known = book["days_left"].notna()
+        tender_stage = book["stage"] == "TENDER"
+        # A tender has no end date until it is awarded; that is expected, not a problem.
+        attention = book["status"].isin(["NEEDS_REVIEW", "CONFLICTING_EVIDENCE", "INSUFFICIENT_EVIDENCE"]) & ~tender_stage
+        kpi_row([
+            ("Contracts tracked", f"{len(book):,}"),
+            ("Ending in 90 days", f"{int((known & book['days_left'].between(0, 90)).sum()):,}"),
+            ("Ending in 12 months", f"{int((known & book['days_left'].between(0, 365)).sum()):,}"),
+            ("Need a closer look", f"{int(attention.sum()):,}"),
+        ])
+        view = st.segmented_control("Show", ["All", "Ending in 90 days", "Need a closer look", "Tenders not awarded yet",
+                                             "End date unknown"], default="All", key="tracker_view")
+        shown = book
+        if view == "Ending in 90 days":
+            shown = book[known & book["days_left"].between(0, 90)]
+        elif view == "Need a closer look":
+            shown = book[attention]
+        elif view == "Tenders not awarded yet":
+            shown = book[tender_stage]
+        elif view == "End date unknown":
+            shown = book[~known & ~tender_stage]
+        confidence_label = {"HIGH": "Strong", "MEDIUM": "Good", "LOW": "Weak"}
+        stage_label = {"AWARDED": "Awarded", "TENDER": "Tender — not awarded yet", "UNCLEAR": "Unclear"}
+        display = pd.DataFrame({
+            "Ends on": [e if isinstance(e, str) else ("Not awarded yet" if st_ == "TENDER" else "Unknown")
+                        for e, st_ in zip(shown["current_expiry_estimate"], shown["stage"])],
+            "Days left": shown["days_left"],
+            "Contract": shown["title"],
+            "Buyer": shown["buyer"].map(buyer_display_name),
+            "Supplier": shown["vendor"].fillna("—"),
+            "Stage": shown["stage"].map(stage_label),
+            "Evidence": [confidence_label.get(c, "—" if st_ == "TENDER" else "Not enough")
+                         for c, st_ in zip(shown["expiry_confidence"], shown["stage"])],
+            "Status": [("Waiting for award" if st_ == "TENDER" and s_ == "INSUFFICIENT_EVIDENCE" else contract_status_label(s_))
+                       for s_, st_ in zip(shown["status"], shown["stage"])],
+            "Latest possible end": shown["current_expiry_ceiling"].fillna("—"),
+            "Documents": shown["documents"],
+        })
+        st.dataframe(display, width="stretch", hide_index=True, column_config={
+            "Contract": st.column_config.TextColumn(width="large"),
+            "Days left": st.column_config.NumberColumn(format="%d"),
+            "Latest possible end": st.column_config.TextColumn(
+                help="End date if every extension option in the documents were used."),
+        })
+        c1, c2 = st.columns([1, 3])
+        c1.download_button("Download (CSV)", data=display.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"my_contracts_{today.isoformat()}.csv", mime="text/csv",
+                           icon=":material/download:")
+        if c2.button("Re-read all documents with the latest rules", icon=":material/refresh:",
+                     help="Reads every tracked document again. Use after an update so documents added "
+                          "earlier benefit from improved reading. The calculation history is kept."):
+            with st.spinner("Re-reading documents..."):
+                n = reread_all(cur)
+            conn.commit()
+            st.session_state.tracker_last_results = None
+            st.toast(f"Re-read {n} contract(s).")
+            st.rerun()
+
+        st.divider()
+        def _ends(r):
+            if isinstance(r.current_expiry_estimate, str):
+                return f"ends {r.current_expiry_estimate}"
+            return "not awarded yet" if r.stage == "TENDER" else "end date unknown"
+        titles = {int(r.id): f"{r.title} · {_ends(r)}" for r in book.itertuples()}
+        chosen = st.selectbox("Open a contract", list(titles), format_func=lambda i: titles[i], key="tracker_pick")
+        if chosen:
+            more = st.file_uploader("Add another document to this contract (e.g. an extension order)",
+                                    type=sorted(ext.lstrip(".") for ext in UPLOAD_EXTENSIONS) + ["zip"], accept_multiple_files=True,
+                                    key=f"tracker_more_{chosen}")
+            if more and st.button("Add to this contract", key=f"tracker_more_btn_{chosen}"):
+                with st.spinner("Reading documents..."):
+                    track_documents(cur, [(u.name, u.getvalue()) for u in more], contract_id=chosen)
+                conn.commit()
+                st.rerun()
+            render_contract_detail(cur, chosen)
+            with st.expander("Remove this contract", icon=":material/delete:"):
+                st.write("Removes the contract and the documents uploaded for it, for example a wrong upload or a "
+                         "duplicate. This cannot be undone.")
+                sure = st.checkbox("Yes, remove it", key=f"tracker_remove_ok_{chosen}")
+                if st.button("Remove contract", key=f"tracker_remove_{chosen}", disabled=not sure, type="primary"):
+                    pipeline.remove_contract(cur, chosen)
+                    conn.commit()
+                    st.session_state.pop("tracker_pick", None)
+                    st.toast("Contract removed.")
+                    st.rerun()
+
+elif page == "Expiry":
+    st.markdown('<div class="eyebrow">Contract expiry radar</div>', unsafe_allow_html=True)
+    st.title("Contracts ending soon")
+    st.markdown(
+        '<div class="page-subtitle">Government contracts whose published completion date is coming up — with the '
+        'current holder and value. A contract ending is the earliest public sign that its replacement will be tendered.</div>',
+        unsafe_allow_html=True,
+    )
+    droot = details_root(historical_root_path())
+    if not droot or not duckdb_available():
+        st.info("Award details are not imported yet. Go to Data Center → Historical Data and import the aoc_details partitions.")
+    else:
+        coverage = cached_expiry_coverage(str(droot))
+        today = datetime.now().date()
+        f1, f2, f3 = st.columns([2, 1.2, 1.2])
+        keyword = f1.text_input("What do you supply?", placeholder="e.g. pipeline, security, painting, civil works", key="exp_keyword").strip()
+        state = f2.text_input("State", placeholder="e.g. Maharashtra", key="exp_state").strip()
+        city = f3.text_input("Buyer, site or city", placeholder="e.g. HPCL, Mumbai", key="exp_city").strip()
+        g1, g2, g3 = st.columns([1.2, 1.2, 2])
+        within_label = g1.selectbox("Ending within", ["3 months", "6 months", "12 months"], index=1, key="exp_within")
+        value_label = g2.selectbox("Contract value", ["Any value", "₹10 lakh+", "₹1 crore+", "₹10 crore+"], key="exp_value")
+        repeat_only = g3.checkbox("Only work this buyer has awarded before", key="exp_repeat",
+                                  help="Contracts whose buyer awarded the same requirement at least once earlier — the strongest re-tender signal.")
+        within_days = {"3 months": 91, "6 months": 182, "12 months": 365}[within_label]
+        min_value = {"Any value": 0, "₹10 lakh+": 1e6, "₹1 crore+": 1e7, "₹10 crore+": 1e8}[value_label]
+
+        try:
+            with st.spinner("Reading award records..."):
+                ending = cached_contracts_ending(str(droot), today.isoformat(), within_days, state, city, keyword, min_value)
+        except Exception as exc:
+            st.error(f"Search failed: {exc}")
+            ending = None
+
+        if ending is not None:
+            if repeat_only:
+                ending = ending[ending["prior_awards"] > 0]
+            if ending.empty:
+                st.info("No published contract end dates match these filters. Try a broader keyword, a longer window or a lower value.")
+            else:
+                kpi_row([
+                    ("Contracts ending", f"{len(ending):,}"),
+                    ("Combined value", format_inr(ending["contract_value"].sum())),
+                    ("Buyers", f"{ending['buyer'].nunique():,}"),
+                    ("Awarded before", f"{int((ending['prior_awards'] > 0).sum()):,}"),
+                ])
+                display = pd.DataFrame({
+                    "Ends on": ending["end_date"].dt.date,
+                    "Days left": (ending["end_date"].dt.date - today).map(lambda d: d.days),
+                    "Buyer": ending["buyer"],
+                    "Contract": ending["description"],
+                    "Current holder": ending["incumbent"],
+                    "Value": ending["contract_value"].map(format_inr),
+                    "Value (INR)": ending["contract_value"],
+                    "Term": ending["duration_days"].map(lambda d: f"{d / 30.44:.0f} months"),
+                    "Bids last time": ending["num_bids_received"],
+                    "Awarded before": ending["prior_awards"].astype(int),
+                    "Tender ID": ending["tender_id"],
+                    "Tender ref.": ending["tender_ref_no"],
+                })
+                st.dataframe(display, width="stretch", hide_index=True, column_config={
+                    "Contract": st.column_config.TextColumn(width="large"),
+                    "Current holder": st.column_config.TextColumn(width="medium"),
+                    "Value (INR)": None,
+                    "Days left": st.column_config.NumberColumn(format="%d"),
+                })
+                st.caption(VERIFY_CAPTION)
+                a1, a2 = st.columns([1, 2])
+                a1.download_button(
+                    "Download list (CSV)", data=display.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"contracts_ending_{today.isoformat()}.csv", mime="text/csv",
+                    icon=":material/download:", type="primary", width="stretch",
+                )
+                with a2:
+                    buyers = ending["buyer"].value_counts().index.tolist()
+                    b1, b2 = st.columns([3, 1])
+                    chosen = b1.selectbox("Open a buyer profile", buyers, key="exp_buyer_pick", label_visibility="collapsed")
+                    b2.button("Open profile", key="exp_open_buyer", on_click=open_buyer, args=(chosen,), width="stretch")
+
+        with st.expander("Where does this come from, and how reliable is it?"):
+            names = ", ".join(coverage["buyer_names"])
+            st.write(
+                f"**Source.** Award-of-contract records on the Central Public Procurement Portal. "
+                f"{coverage['contracts_with_end_date']:,} awarded contracts carry a completion date published by the buyer "
+                f"itself; nothing is estimated. Buyers that publish completion dates today: {names}."
+            )
+            st.write(
+                "**Accuracy check.** For past dates, the check takes contracts that were due to end in the next six months, "
+                "then looks at when the same buyer awarded the same work again."
+            )
+            if st.button("Run accuracy check (about 20 seconds)", key="exp_backtest"):
+                with st.spinner("Re-running the past..."):
+                    st.session_state.exp_backtest_result = cached_expiry_backtest(str(droot))
+            results = st.session_state.get("exp_backtest_result")
+            if results:
+                rows = []
+                for as_of, summary in results:
+                    r = summary.iloc[0]
+                    rows.append({
+                        "Pretend date": as_of.strftime("%d %b %Y"),
+                        "Contracts tested": int(r["contracts_tested"]),
+                        "Re-awarded later": f"{r['reawarded_by_data_end']:.0%}",
+                        "Of those, within 90 days of end date": f"{r['hit_rate_when_reawarded']:.0%}",
+                        "New award near end date": f"{r['hit_rate_near_end_date']:.1%}",
+                        "Same-width window at a wrong time": f"{r['baseline_hit_rate']:.1%}",
+                    })
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                st.caption(
+                    "Read the last two columns together: when they are close, the end date told us nothing about timing; when the "
+                    "first is clearly higher, it did. Many contracts are one-off works that are never re-awarded, so treat each "
+                    "row as a lead to watch, not a guaranteed tender."
+                )
+
+elif page == "Buyer":
+    st.markdown('<div class="eyebrow">Buyer intelligence</div>', unsafe_allow_html=True)
+    st.title("Buyer profiles")
+    st.markdown(
+        '<div class="page-subtitle">What a government buyer awards, to whom, how competitive it is, and which of its contracts end next.</div>',
+        unsafe_allow_html=True,
+    )
+    droot = details_root(historical_root_path())
+    if not droot or not duckdb_available():
+        st.info("Award details are not imported yet. Go to Data Center → Historical Data and import the aoc_details partitions.")
+    else:
+        today = datetime.now().date()
+        query = st.text_input("Find a buyer", placeholder="e.g. Hindustan Petroleum, BHEL, AIIMS, Municipal Corporation", key="buyer_search").strip()
+        selected = st.session_state.get("buyer_selected")
+        if query:
+            matches = cached_search_buyers(str(droot), query)
+            if matches.empty:
+                st.info("No buyer name contains that text. Try a shorter part of the name.")
+            else:
+                options = matches["buyer"].tolist()
+                labels = {b: f"{l} · {a:,} awards" for b, l, a in zip(matches["buyer"], matches["label"], matches["awards"])}
+                index = options.index(selected) if selected in options else 0
+                selected = st.selectbox("Buyer", options, index=index, format_func=lambda b: labels[b], key="buyer_pick")
+                st.session_state.buyer_selected = selected
+        else:
+            selected = None
+
+        if selected:
+            with st.spinner("Building profile..."):
+                profile = cached_buyer_profile(str(droot), selected, today.isoformat())
+            s = profile["summary"]
+            st.subheader(s["buyer"])
+            st.caption(f"Award records from {s['first_award']:%d %b %Y} to {s['last_award']:%d %b %Y}.")
+            kpi_row([
+                ("Contracts awarded", f"{s['awards']:,}"),
+                ("Total awarded value", format_inr(s["total_value"])),
+                ("Distinct suppliers", f"{s['distinct_suppliers']:,}"),
+                ("Median bids per tender", f"{s['median_bids']:.0f}" if s["median_bids"] else "—"),
+                ("Ending in 12 months", f"{len(profile['ending']):,}"),
+            ])
+
+            d1, d2, d3 = st.columns([2, 1, 1])
+            prepared_for = d1.text_input("Prepared for (optional, printed on the brief)", key="brief_for", placeholder="Your client or company name")
+            pdf = build_buyer_brief(profile, prepared_for=prepared_for.strip(), generated=today)
+            safe = "".join(ch if ch.isalnum() else "_" for ch in s["buyer"])[:60]
+            d2.download_button("Opportunity Brief (PDF)", data=pdf, file_name=f"opportunity_brief_{safe}.pdf",
+                               mime="application/pdf", icon=":material/picture_as_pdf:", type="primary", width="stretch")
+            d3.download_button("Ending contracts (CSV)", data=profile["ending"].to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"contracts_ending_{safe}.csv", mime="text/csv",
+                               icon=":material/download:", width="stretch")
+
+            t1, t2, t3, t4 = st.tabs(["Contracts ending", "Repeat requirements", "Top suppliers", "Recent awards"])
+            with t1:
+                ending = profile["ending"]
+                if ending.empty:
+                    st.info("This buyer has not published completion dates for contracts ending in the next 12 months.")
+                else:
+                    st.dataframe(pd.DataFrame({
+                        "Ends on": ending["end_date"].dt.date,
+                        "Contract": ending["description"],
+                        "Current holder": ending["incumbent"],
+                        "Value": ending["contract_value"].map(format_inr),
+                        "Term": ending["duration_days"].map(lambda d: f"{d / 30.44:.0f} months"),
+                        "Awarded before": ending["prior_awards"].astype(int),
+                        "Tender ID": ending["tender_id"],
+                        "Tender ref.": ending["tender_ref_no"],
+                    }), width="stretch", hide_index=True,
+                        column_config={"Contract": st.column_config.TextColumn(width="large")})
+            with t2:
+                repeat = profile["repeat_requirements"]
+                if repeat.empty:
+                    st.info("No requirement has been awarded more than once by this buyer.")
+                else:
+                    st.dataframe(pd.DataFrame({
+                        "Requirement (latest wording)": repeat["requirement"],
+                        "Awards": repeat["awards"],
+                        "Total value": repeat["value"].map(format_inr),
+                        "First award": repeat["first_award"].dt.date,
+                        "Latest award": repeat["last_award"].dt.date,
+                    }), width="stretch", hide_index=True,
+                        column_config={"Requirement (latest wording)": st.column_config.TextColumn(width="large")})
+            with t3:
+                suppliers = profile["suppliers"]
+                if suppliers.empty:
+                    st.info("No named suppliers in this buyer's award records.")
+                else:
+                    st.dataframe(pd.DataFrame({
+                        "Supplier": suppliers["supplier"],
+                        "Contracts won": suppliers["contracts_won"],
+                        "Value of contracts won": suppliers["value_involved"].map(format_inr),
+                        "Latest win": suppliers["last_win"].dt.date,
+                    }).head(200), width="stretch", hide_index=True)
+                    st.caption("Joint awards count once for each named winner; value is that of the whole contract.")
+            with t4:
+                recent = profile["recent_awards"]
+                st.dataframe(pd.DataFrame({
+                    "Awarded": recent["contract_date"].dt.date,
+                    "Contract": recent["description"],
+                    "Winner": recent["incumbent"],
+                    "Value": recent["contract_value"].map(format_inr),
+                    "Bids": recent["num_bids_received"],
+                    "Tender ID": recent["tender_id"],
+                    "Tender ref.": recent["tender_ref_no"],
+                }), width="stretch", hide_index=True, column_config={
+                    "Contract": st.column_config.TextColumn(width="large"),
+                })
+            st.caption(VERIFY_CAPTION)
+        elif not query:
+            st.markdown('<div class="empty-calm">Search for any central or state government buyer.</div>', unsafe_allow_html=True)
+            st.write("Profiles cover every buyer in the CPPP award records — not only those that publish end dates.")
+
+elif page == "Finder":
+    st.markdown('<div class="eyebrow">Repeat government buyers</div>', unsafe_allow_html=True)
+    st.title("Repeat buyers")
+    aoc_root = find_historical_aoc_root(historical_root_path())
+    if not aoc_root or not duckdb_available():
+        st.info("No award history is available yet. Go to Data Center → Historical Data and import at least 3 years of AOC data.")
+    else:
+        stats = cached_aoc_stats(str(aoc_root))
+        years = stats.get("year_values", [])
+        st.caption(
+            f"Government buyers who keep awarding contracts for what you supply, found from "
+            f"{stats.get('total', 0):,} official award records ({years[0]}–{years[-1]}) on the Central Public Procurement Portal."
+            if years else "Government buyers who keep awarding contracts for what you supply, found from official award history."
+        )
+        if len(years) < 3:
+            st.warning(f"Only {len(years)} year(s) of award history imported. Annual contracts need 3+ years to show a pattern — import more years in Data Center.")
+
+        f1, f2, f3, f4 = st.columns([2, 1.2, 1.2, 1.2])
+        keyword = f1.text_input("What do you supply?", placeholder="e.g. CCTV, housekeeping, security, lift", key="finder_keyword").strip()
+        state = f2.text_input("State", placeholder="e.g. Maharashtra", key="finder_state").strip()
+        city = f3.text_input("City, district or buyer", placeholder="e.g. Pune, AIIMS", key="finder_city").strip()
+        min_signal = f4.selectbox("Evidence", ["Medium or strong", "Strong only", "All, incl. early"], key="finder_signal")
+
+        today = datetime.now().date()
+        try:
+            with st.spinner("Scanning award history (first search takes ~20 seconds, repeats are instant)..."):
+                signal_df = cached_cycle_signals(str(aoc_root), today.isoformat(), state, city, keyword)
+        except Exception as exc:
+            st.error(f"Opportunity search failed: {exc}")
+            signal_df = None
+
+        if signal_df is not None:
+            allowed = {"All, incl. early": {"HIGH", "MEDIUM", "EARLY"}, "Medium or strong": {"HIGH", "MEDIUM"}, "Strong only": {"HIGH"}}[min_signal]
+            signal_df = signal_df[signal_df["signal_strength"].isin(allowed)].copy()
+            signal_df["_rank"] = signal_df["signal_strength"].map({"HIGH": 0, "MEDIUM": 1, "EARLY": 2})
+            signal_df = signal_df.sort_values(["_rank", "award_count", "last_award_date"], ascending=[True, False, False])
+            if signal_df.empty:
+                st.info("No repeat buyers match these filters. Try a broader keyword, remove the state/city filter, or include early signals.")
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Repeat requirements", f"{len(signal_df):,}")
+                m2.metric("Strong evidence", f"{int((signal_df['signal_strength'] == 'HIGH').sum()):,}")
+                m3.metric("Distinct buyers", f"{signal_df['org_name'].nunique():,}")
+
+                display = pd.DataFrame({
+                    "Evidence": signal_df["signal_strength"].map({"HIGH": "Strong", "MEDIUM": "Medium", "EARLY": "Early"}),
+                    "Buyer": signal_df["org_name"].map(buyer_display_name),
+                    "State": signal_df["state"].fillna(""),
+                    "Requirement (latest title)": signal_df["title"],
+                    "Awards seen": signal_df["award_count"].astype(int),
+                    "Typical gap": signal_df["median_gap_days"].map(lambda d: f"~{d / 30.44:.0f} months"),
+                    "First seen": signal_df["first_award_date"].dt.date,
+                    "Last awarded": signal_df["last_award_date"].dt.date,
+                    "Last tender ID": signal_df["last_tender_id"],
+                })
+                st.dataframe(display, width="stretch", hide_index=True, column_config={
+                    "Requirement (latest title)": st.column_config.TextColumn(width="large"),
+                    "Buyer": st.column_config.TextColumn(width="medium"),
+                })
+                st.caption(VERIFY_CAPTION)
+                st.download_button(
+                    "Download this list (CSV)", data=display.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"repeat_buyers_{today.isoformat()}.csv", mime="text/csv",
+                    icon=":material/download:", type="primary",
+                )
+                st.caption(
+                    "How this works: the same buyer awarded the same requirement at least twice. "
+                    "Strong = 6+ awards at a steady pace; Medium = 4+ awards; Early = 2–3 awards. "
+                    "This shows who keeps buying, not the date of the next tender — add the "
+                    "buyer's current award or work order under My contracts to find when it ends."
+                )
+
+        with st.expander("How reliable is this?"):
+            check_as_of = datetime(today.year - 1, 1, 1).date()
+            st.write(
+                f"The accuracy check pretends it is {check_as_of:%d %b %Y}, builds this list from older awards only, "
+                "and then looks at what those buyers actually did afterwards."
+            )
+            if st.button("Run accuracy check (about 30 seconds)", key="finder_backtest"):
+                with st.spinner("Re-running the past..."):
+                    st.session_state.finder_backtest_result = cached_backtest(str(aoc_root), check_as_of.isoformat())
+            result = st.session_state.get("finder_backtest_result")
+            if result:
+                summary = result["summary"].set_index("evidence")
+                rows = []
+                for key, label in (("HIGH", "Strong"), ("MEDIUM", "Medium"), ("EARLY", "Early")):
+                    if key in summary.index and summary.loc[key, "scored"]:
+                        rows.append({
+                            "Evidence": label,
+                            "Requirements tested": int(summary.loc[key, "scored"]),
+                            "Bought again afterwards": f"{summary.loc[key, 'retendered_by_data_end']:.0%}",
+                            "Hit in predicted window": f"{summary.loc[key, 'hit_rate']:.0%}",
+                            "Hit in a wrong-time window": f"{summary.loc[key, 'baseline_hit_rate']:.0%}",
+                        })
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                st.caption(
+                    f"Checked against awards up to {result['data_end']:%d %b %Y}. “Bought again afterwards” is the "
+                    "figure to rely on. The two window columns show that timing a re-tender from award history alone "
+                    "is no better than chance, which is why this list does not promise dates."
+                )
+
 elif page == "Radar":
     cur, conn = get_cursor()
     aoc_root = find_historical_aoc_root(historical_root_path())
     if aoc_root and duckdb_available():
-        from core.dataset_import import historical_aoc_stats, query_historical_aocs, historical_aoc_cycle_signals
+        from core.dataset_import import historical_aoc_stats, query_historical_aocs
         st.divider()
-        st.markdown('<div class="eyebrow">Recurring procurement intelligence</div>', unsafe_allow_html=True)
-        st.subheader("Predicted upcoming re-opportunities")
-        st.caption("These are calculated predictions from repeated historical AOC award dates. They are not confirmed future tenders until a new tender notice is detected.")
-        try:
-            rc1, rc2 = st.columns(2)
-            with rc1:
-                radar_state = st.text_input("State / Region Filter", placeholder="e.g. Maharashtra", key="radar_state").strip()
-            with rc2:
-                radar_city = st.text_input("City / District Filter", placeholder="e.g. Pune", key="radar_city").strip()
-
-            with st.spinner("Aggregating historical dataset (this runs extremely fast via DuckDB)..."):
-                signal_df = historical_aoc_cycle_signals(aoc_root, as_of=datetime.now().date(), horizon_days=365, limit=None, state=radar_state, city=radar_city)
-            if signal_df.empty:
-                st.info("No recurring procurement pattern was found in the imported AOC partitions for the next 12 months. Check the imported-year count below and make sure all intended year partitions are present.")
-            else:
-                today = datetime.now().date()
-                current_mask = (signal_df["window_start"].dt.date <= today) & (signal_df["window_end"].dt.date >= today)
-                current_count = int(current_mask.sum())
-                future_count = int((signal_df["expected_next_date"].dt.date > today).sum())
-                s1, s2, s3 = st.columns(3)
-                s1.metric("Recurring signals", f"{len(signal_df):,}")
-                s2.metric("In expected window now", f"{current_count:,}")
-                s3.metric("Expected within 12 months", f"{future_count:,}")
-                display = signal_df.copy()
-                display["Expected window"] = display.apply(lambda r: f"{r['window_start'].date()} → {r['window_end'].date()}", axis=1)
-                display["Last award"] = display["last_award_date"].dt.date
-                display["Typical cycle"] = display["median_gap_days"].map(lambda x: f"{int(x)} days (~{x/30.44:.1f} mo)")
-                display["Evidence"] = display["award_count"].map(lambda x: f"{int(x)} awards")
-                display["Status"] = display.apply(lambda r: "🟡 Window now" if r["window_start"].date() <= today <= r["window_end"].date() else "🟡 Expected", axis=1)
-                cols = ["Status", "signal_strength", "org_name", "title", "Expected window", "Last award", "Typical cycle", "Evidence", "last_tender_id", "last_detail_url"]
-                display = display[cols].rename(columns={
-                    "signal_strength": "Signal", "org_name": "Organisation", "title": "Requirement",
-                    "last_tender_id": "Last Tender ID", "last_detail_url": "Source"
-                })
-                st.dataframe(display, use_container_width=True, hide_index=True, column_config={
-                    "Source": st.column_config.LinkColumn("Source", display_text="Open"),
-                    "Requirement": st.column_config.TextColumn("Requirement", width="large"),
-                    "Organisation": st.column_config.TextColumn("Organisation", width="medium"),
-                })
-                st.caption("Method: same buyer + normalized requirement family, at least 2 dated awards, median historical interval, and an uncertainty window based on observed interval spread. This is an analytical prediction, not a guarantee of re-tendering.")
-        except Exception as exc:
-            st.error(f"Recurring opportunity analysis failed: {exc}")
-
         st.markdown('<div class="eyebrow">Historical award intelligence</div>', unsafe_allow_html=True)
         st.subheader("AOC history")
         stats = historical_aoc_stats(aoc_root)
@@ -606,8 +1126,8 @@ elif page == "Radar":
             aoc_df = query_historical_aocs(aoc_root, aoc_search, aoc_year, aoc_portal, limit=None)
             st.caption(f"Showing {len(aoc_df):,} matching AOC records. Source records remain read-only in Parquet.")
             if not aoc_df.empty:
-                st.dataframe(aoc_df, use_container_width=True, hide_index=True, column_config={
-                    "detail_url": st.column_config.LinkColumn("Source", display_text="Open"),
+                st.dataframe(aoc_df, width="stretch", hide_index=True, column_config={
+                    "detail_url": None,
                     "title": st.column_config.TextColumn("Award / Requirement", width="large"),
                     "org_name": st.column_config.TextColumn("Organisation", width="medium"),
                 })
@@ -689,7 +1209,8 @@ elif page == "Settings":
 # ---------------------------------------------------------------------
 elif page == "Upload Document":
     cur, conn = get_cursor()
-    st.title("Document Upload / Ingestion")
+    st.title("Add a document manually")
+    st.caption("For full control: choose the document type and the contract it belongs to yourself. For everyday use, My contracts does this automatically.")
 
     contracts = db.list_contracts(cur)
     contract_titles = {c["title"]: c["id"] for c in contracts}
@@ -925,8 +1446,10 @@ elif page == "Procurement Cycles":
                 )
 
 else:
-    st.session_state.active_page = "Overview"
+    st.session_state.active_page = "Tracker"
     st.rerun()
+
+close_page_connections()
 
 
 

@@ -28,7 +28,7 @@ def contract_status_label(status: str) -> str:
         "CONFLICTING_EVIDENCE": "We found conflicting information",
         "INSUFFICIENT_EVIDENCE": "Not enough information yet",
         "HIGH_CONFIDENCE": "Strong supporting evidence",
-        "VERIFIED": "Reviewed information",
+        "VERIFIED": "Confirmed by the documents",
         "NEEDS_REVIEW": "Needs a closer look",
         "EXPIRED_UNVERIFIED": "May have ended",
         "EXPIRED": "Recorded end date has passed",
@@ -53,7 +53,8 @@ def acquisition_status_label(status: str) -> str:
 
 
 def buyer_display_name(value: str | None) -> str:
-    if not value:
+    # pandas hands missing values over as NaN (a float), not None.
+    if not isinstance(value, str) or not value.strip():
         return "Organisation not listed"
     return " · ".join(part.strip() for part in value.split("||") if part.strip())
 
@@ -413,7 +414,7 @@ def render_organisations(cur):
         {"Organisation": row["name"], "Requirements": row["requirement_count"],
          "Contracts": row["contract_count"], "Tender observations": row["tender_count"]}
         for row in rows
-    ], use_container_width=True, hide_index=True)
+    ], width="stretch", hide_index=True)
 
 
 def render_documents(cur):
@@ -432,7 +433,7 @@ def render_documents(cur):
                  "Status": row["status"], "Downloaded": row["downloaded_at"] or "Not downloaded",
                  "SHA-256": row["sha256"] or "Not available", "Source URL": row["document_url"]}
                 for row in rows
-            ], use_container_width=True, hide_index=True)
+            ], width="stretch", hide_index=True)
         else:
             st.info("No tender documents have been acquired yet.")
     with tabs[1]:
@@ -447,7 +448,7 @@ def render_documents(cur):
                  "Document": row["doc_title"] or "Untitled", "Date": row["doc_date"] or "Unknown",
                  "Source URL": row["source_url"] or "Uploaded"}
                 for row in rows
-            ], use_container_width=True, hide_index=True)
+            ], width="stretch", hide_index=True)
         else:
             st.info("No contract documents have been ingested.")
 
@@ -529,7 +530,7 @@ def render_sources(cur):
             {"Source": row["name"], "Status": row["status"], "Enabled": bool(row["enabled"]),
              "Last scan": row["last_scan_at"] or "Never", "Last success": row["last_success_at"] or "Never"}
             for row in sources
-        ], use_container_width=True, hide_index=True)
+        ], width="stretch", hide_index=True)
     else:
         st.info("No procurement sources have completed a scan yet.")
     st.subheader("CPPP source settings")

@@ -76,3 +76,8 @@ def test_history_timeline_uses_at_most_four_past_years_plus_now():
     assert history_timeline_years(dates, current_year=2026) == [
         "2022", "2023", "2024", "2025", "2026"
     ]
+
+def test_buyer_display_name_handles_missing_values_from_pandas():
+    assert buyer_display_name(float("nan")) == "Organisation not listed"
+    assert buyer_display_name(None) == "Organisation not listed"
+    assert buyer_display_name("A||B") == "A · B"

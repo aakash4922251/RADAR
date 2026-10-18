@@ -144,34 +144,110 @@ def ingest_document(
     )
 
 
+def _delete_events(cur, where: str, params: tuple) -> set[int]:
+    """Delete procurement events matching ``where`` and the rows that point at
+    them; returns the requirements whose history changed."""
+    event_ids = [r["id"] for r in cur.execute(f"SELECT id FROM procurement_events WHERE {where}", params)]
+    requirement_ids: set[int] = set()
+    for event_id in event_ids:
+        requirement_ids.update(r["requirement_id"] for r in cur.execute(
+            "SELECT requirement_id FROM requirement_event_links WHERE event_id = ?", (event_id,)))
+        cur.execute("DELETE FROM prediction_matches WHERE event_id = ?", (event_id,))
+        cur.execute("DELETE FROM requirement_event_links WHERE event_id = ?", (event_id,))
+        cur.execute("DELETE FROM procurement_events WHERE id = ?", (event_id,))
+    return requirement_ids
+
+
+def remove_contract(cur, contract_id: int) -> None:
+    """Remove a contract and everything recorded from its documents (a wrong
+    upload, a duplicate). Requirement cycle statistics that used its events
+    are recomputed so Layer 2/3 stay consistent."""
+    doc_ids = [r["id"] for r in cur.execute("SELECT id FROM documents WHERE contract_id = ?", (contract_id,))]
+    marks = ",".join("?" * len(doc_ids)) or "NULL"
+    requirement_ids = _delete_events(cur, f"contract_id = ? OR document_id IN ({marks})", (contract_id, *doc_ids))
+    cur.execute("DELETE FROM fact_conflicts WHERE contract_id = ?", (contract_id,))
+    cur.execute("UPDATE extracted_facts SET superseded_by_fact_id = NULL WHERE contract_id = ?", (contract_id,))
+    cur.execute(f"DELETE FROM extracted_facts WHERE contract_id = ? OR document_id IN ({marks})", (contract_id, *doc_ids))
+    for table in ("contract_timeline_events", "expiry_calculations", "confidence_assessment"):
+        cur.execute(f"DELETE FROM {table} WHERE contract_id = ?", (contract_id,))
+    cur.execute("DELETE FROM requirement_aliases WHERE source_contract_id = ?", (contract_id,))
+    cur.execute(f"UPDATE acquired_documents SET document_id = NULL WHERE document_id IN ({marks})", tuple(doc_ids))
+    cur.execute(f"UPDATE documents SET supersedes_document_id = NULL WHERE supersedes_document_id IN ({marks})",
+                tuple(doc_ids))
+    cur.execute("DELETE FROM documents WHERE contract_id = ?", (contract_id,))
+    cur.execute("DELETE FROM contracts WHERE id = ?", (contract_id,))
+    from core.procurement_cycles import recompute_and_store
+    from core.radar import refresh_prediction
+    for requirement_id in requirement_ids:
+        recompute_and_store(cur, requirement_id)
+        refresh_prediction(cur, requirement_id)
+
+
+def reread_contract(cur, contract_id: int, doc_type_for=None) -> dict:
+    """Re-extract every document of a contract with the current rules.
+
+    Facts read by an older version of the extractor (and everything derived
+    from them: conflicts, fact-sourced procurement events) are replaced; the
+    documents themselves and the append-only expiry_calculations history are
+    kept, so the Proof Packet still shows how the estimate changed.
+    ``doc_type_for(document_row) -> str | None`` may re-classify documents.
+    Documents are re-read in upload order, exactly as if uploaded again.
+    """
+    docs = cur.execute("SELECT * FROM documents WHERE contract_id = ? ORDER BY id", (contract_id,)).fetchall()
+    _delete_events(cur, "contract_id = ? AND source_fact_id IS NOT NULL", (contract_id,))
+    cur.execute("DELETE FROM fact_conflicts WHERE contract_id = ?", (contract_id,))
+    cur.execute("UPDATE extracted_facts SET superseded_by_fact_id = NULL WHERE contract_id = ?", (contract_id,))
+    cur.execute("DELETE FROM extracted_facts WHERE contract_id = ?", (contract_id,))
+
+    for doc in docs:
+        if doc_type_for is not None:
+            new_type = doc_type_for(doc)
+            if new_type and new_type != doc["doc_type"]:
+                cur.execute("UPDATE documents SET doc_type = ? WHERE id = ?", (new_type, doc["id"]))
+        for f in extraction.extract_all_facts(doc["raw_text"] or ""):
+            db.insert_fact(
+                cur, contract_id=contract_id, document_id=doc["id"], fact_type=f.fact_type,
+                fact_value=f.value, evidence_quote=f.evidence_quote, context_window=f.context_window,
+                char_offset_start=f.char_offset_start, char_offset_end=f.char_offset_end,
+                extraction_rule_id=f.extraction_rule_id, fact_confidence=f.fact_confidence,
+            )
+        reconciliation.reconcile_new_document(cur, contract_id, doc["id"])
+
+    result = recalculate_contract(cur, contract_id)
+    from core.requirements_pipeline import link_contract_to_requirement
+    link_contract_to_requirement(cur, contract_id)
+    return result
+
+
 def _sync_org_vendor(cur, contract_id: int, facts: list) -> None:
     """
     Populates contracts.org_id / vendor_id from the highest-confidence
     organisation_name / vendor_name facts, if any exist and the contract
     doesn't already have them set. This was previously never wired up —
     org_id/vendor_id stayed NULL forever — which Layer 2's requirement
-    identity depends on (organisation match is a hard gate). Idempotent
-    and additive: never overwrites a value that's already set, so a
-    later, lower-confidence mention can't flip an established identity.
+    identity depends on (organisation match is a hard gate). Idempotent:
+    an established name is kept while any current (non-superseded) fact
+    still states it, so a later, lower-confidence mention can't flip it.
+    It changes only when the fact it came from was superseded by stronger
+    evidence (see reconciliation's name rule).
     """
     contract = db.get_contract(cur, contract_id)
     if contract is None:
         return
+    rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     updates = {}
-    if contract["org_id"] is None:
-        org_facts = sorted(
-            (f for f in facts if f["fact_type"] == "organisation_name"),
-            key=lambda f: 0 if f["fact_confidence"] == "HIGH" else 1,
-        )
-        if org_facts:
-            updates["org_id"] = db.get_or_create(cur, "organisations", org_facts[0]["fact_value"])
-    if contract["vendor_id"] is None:
-        vendor_facts = sorted(
-            (f for f in facts if f["fact_type"] == "vendor_name"),
-            key=lambda f: 0 if f["fact_confidence"] == "HIGH" else 1,
-        )
-        if vendor_facts:
-            updates["vendor_id"] = db.get_or_create(cur, "vendors", vendor_facts[0]["fact_value"])
+    for fact_type, column, table in (("organisation_name", "org_id", "organisations"),
+                                     ("vendor_name", "vendor_id", "vendors")):
+        candidates = sorted((f for f in facts if f["fact_type"] == fact_type),
+                            key=lambda f: rank.get(f["fact_confidence"], 3))
+        if not candidates:
+            continue
+        current = None
+        if contract[column] is not None:
+            row = cur.execute(f"SELECT name FROM {table} WHERE id = ?", (contract[column],)).fetchone()
+            current = row["name"] if row else None
+        if current is None or current not in {f["fact_value"] for f in candidates}:
+            updates[column] = db.get_or_create(cur, table, candidates[0]["fact_value"])
     if updates:
         db.update_contract_status(cur, contract_id, **updates)
 
@@ -188,8 +264,11 @@ def recalculate_contract(cur, contract_id: int) -> dict:
 
     expiry_result = compute_expiry(facts)
 
-    award_facts = [f for f in facts if f["fact_type"] == "award_date"]
-    award_fact = award_facts[0] if award_facts else None
+    # Award evidence: an explicit award date, else the Letter of Award or work
+    # order date. Those documents are the award, so their date is the award
+    # event even when the word "award" never appears.
+    award_fact = next((f for kind in ("award_date", "loa_date", "work_order_date")
+                       for f in facts if f["fact_type"] == kind), None)
 
     open_conflicts = db.list_open_conflicts(cur, contract_id)
 

@@ -122,7 +122,7 @@ def assess_confidence(expiry_result: ExpiryResult, facts: list, documents_by_id:
         limiting = "none — all dimensions at or above threshold"
         if start_conf == "MEDIUM":
             expiry_conf = "MEDIUM"
-            limiting = "start_date (award date used as proxy)"
+            limiting = "start_date (award or work-order date used as proxy)"
     elif all(_RANK[v] >= _RANK["MEDIUM"] for v in dims.values()) and not has_conflict:
         expiry_conf = "MEDIUM"
         med_dims = [k for k, v in dims.items() if v == "MEDIUM"]

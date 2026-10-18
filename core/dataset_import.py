@@ -253,62 +253,105 @@ def historical_aoc_stats(root: str | Path) -> dict[str, Any]:
     }
 
 
-def historical_aoc_cycle_signals(root: str | Path, as_of=None, horizon_days: int = 365, limit: int | None = 100, state: str = "", city: str = ""):
-    """Return evidence-backed recurring AOC opportunity windows.
-
-    Uses exact buyer + normalized requirement title as the conservative identity.
-    Two dated awards are enough to create an EARLY signal (one observed interval);
-    three or more awards create MEDIUM/HIGH signals with a more stable median cycle.
-    This is a re-opportunity signal, never a confirmed future tender.
-    """
-    duckdb = duckdb_available()
-    if duckdb is None:
-        raise RuntimeError("DuckDB is not installed. Run: python -m pip install duckdb")
-    root = Path(root)
-    pattern = str(root / "aoc_tenders" / "year=*" / "data.parquet").replace("\\", "/")
-    safe_pattern = pattern.replace("'", "''")
+def _as_date(value):
     import datetime as _dt
-    if as_of is None:
-        as_of = _dt.date.today()
-    elif isinstance(as_of, _dt.datetime):
-        as_of = as_of.date()
-    elif isinstance(as_of, str):
-        as_of = _dt.date.fromisoformat(as_of)
-    horizon = as_of + _dt.timedelta(days=max(1, int(horizon_days)))
+    if value is None:
+        return _dt.date.today()
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, str):
+        return _dt.date.fromisoformat(value)
+    return value
 
-    con = duckdb.connect()
-    # Identity: same buyer + a normalized requirement family. Generic procurement
-    # words are removed so common wording changes (AMC/maintenance/services/etc.)
-    # can still form a family, while the buyer constraint prevents cross-organisation
-    # merging. Two awards yield an EARLY signal; 3+ yield stronger evidence.
-    sql = f"""
-    WITH base AS (
+
+def _aoc_filters(state: str = "", city: str = "", keyword: str = "") -> tuple[str, list]:
+    """SQL AND-clauses for the user-facing filters. User-typed values are bound
+    as parameters, never interpolated into SQL."""
+    filters, params = [], []
+    state, city, keyword = (state or "").strip(), (city or "").strip(), (keyword or "").strip()
+    if state and state.lower() != "all":
+        filters.append("(LOWER(COALESCE(state, '')) LIKE LOWER(?) OR LOWER(org_name) LIKE LOWER(?))")
+        params.extend([f"%{state}%"] * 2)
+    if city and city.lower() != "all":
+        filters.append("(LOWER(org_name) LIKE LOWER(?) OR LOWER(title) LIKE LOWER(?))")
+        params.extend([f"%{city}%"] * 2)
+    for word in keyword.split():
+        filters.append("LOWER(title) LIKE LOWER(?)")
+        params.append(f"%{word}%")
+    return "".join(f"\n          AND {f}" for f in filters), params
+
+
+_FAMILY_STOPWORDS = (
+    "annual|comprehensive|maintenance|contract|contracts|services?|supply|supplies|providing|provision|"
+    "procurement|work|works|for|of|the|at|and|in|to|on|by|from|with|under|through|hiring|engagement|rate|"
+    "tender|tenders|etender|nit|bid|call|selection|appointment|amc|camc|repair|repairs|operation|operations|"
+    "year|years|yearly|financial|period|please|refer|notice|various|other|etc|[a-z]{1,2}"
+)
+
+
+def _org_key_sql(column: str) -> str:
+    """Buyer identity: lower-cased, alphanumerics only. "||" separators and
+    missing spaces around them (both occur in CPPP data) normalise alike."""
+    return (f"trim(regexp_replace(regexp_replace(LOWER(COALESCE({column}, '')), '\\|\\|', '', 'g'), "
+            f"'[^a-z0-9]+', ' ', 'g'))")
+
+
+def _family_key_sql(column: str) -> str:
+    """Requirement family: the title minus the per-cycle reference after "/ ",
+    digits, HTML entities and generic procurement words."""
+    return f"""trim(regexp_replace(
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(
+                            regexp_replace(LOWER(COALESCE({column}, '')), '(?s)/\\s.*$', ''),
+                            '&#?[a-z0-9]+;', ' ', 'g'
+                        ),
+                        '[^a-z]+', ' ', 'g'
+                    ),
+                    '\\b({_FAMILY_STOPWORDS})\\b', ' ', 'g'
+                ),
+                '\\s+', ' ', 'g'
+            ))"""
+
+
+def _aoc_awards_ctes(safe_pattern: str, filter_sql: str, date_column: str = "aoc_date") -> str:
+    """CTEs ``raw``, ``base`` and ``dedup``: one row per distinct dated award,
+    keyed by buyer (``org_key``) and requirement family (``title_family_key``).
+
+    Identity: same buyer + a normalized requirement family. CPPP titles carry
+    the tender reference after "/ " (e.g. "Housekeeping at X/ NIT/E1571/20-21"),
+    which changes every cycle, so it is cut off along with digits, HTML
+    entities and generic procurement words; what remains is the stable
+    description of the need. Titles with fewer than two meaningful words
+    ("REPAIR", "please refer tender notice") are too vague to identify a
+    requirement and are excluded rather than merged.
+
+    ``date_column`` picks the event date: ``aoc_date`` (award published) or
+    ``closing_date`` (bid submission closed, i.e. when the tender ran).
+    """
+    if date_column not in ("aoc_date", "closing_date"):
+        raise ValueError(f"unsupported date column: {date_column}")
+    return f"""
+    raw AS (
         SELECT
-            {_aoc_date_sql("aoc_date")} AS award_date,
+            {_aoc_date_sql(date_column)} AS award_date,
             NULLIF(TRIM(org_name), '') AS org_name,
             NULLIF(TRIM(title), '') AS title,
-            tender_id, ref_no, portal_type, detail_url,
-            regexp_replace(
-                regexp_replace(LOWER(TRIM(COALESCE(org_name, ''))), '[^a-z0-9]+', ' ', 'g'),
-                '\\s+', ' ', 'g'
-            ) AS org_key,
+            tender_id, ref_no, portal_type, detail_url, state,
+            {_org_key_sql('org_name')} AS org_key,
             regexp_replace(
                 regexp_replace(LOWER(TRIM(COALESCE(title, ''))), '[^a-z0-9]+', ' ', 'g'),
                 '\\s+', ' ', 'g'
             ) AS title_key,
-            trim(regexp_replace(
-                regexp_replace(
-                    regexp_replace(LOWER(TRIM(COALESCE(title, ''))), '[^a-z0-9]+', ' ', 'g'),
-                    '\\b(annual|comprehensive|maintenance|contract|services?|service|supply|supplies|providing|procurement|work|works|for|of|the|at|and|in|to|on|through|hiring|engagement|rate|tender|bid|selection|appointment|amc|camc|repair|repairs|operation|operations)\\b', ' ', 'g'
-                ),
-                '\\s+', ' ', 'g'
-            )) AS title_family_key
+            {_family_key_sql('title')} AS title_family_key
         FROM read_parquet('{safe_pattern}', union_by_name = true)
-        WHERE {_aoc_date_sql("aoc_date")} IS NOT NULL
+        WHERE {_aoc_date_sql(date_column)} IS NOT NULL
           AND COALESCE(TRIM(org_name), '') <> ''
-          AND COALESCE(TRIM(title), '') <> ''
-          {f" AND LOWER(org_name) LIKE '%{state.lower()}%'" if state and state.lower() != 'all' else ""}
-          {f" AND (LOWER(org_name) LIKE '%{city.lower()}%' OR LOWER(title) LIKE '%{city.lower()}%')" if city and city.lower() != 'all' else ""}
+          AND COALESCE(TRIM(title), '') <> ''{filter_sql}
+    ),
+    base AS (
+        SELECT * FROM raw
+        WHERE len(string_split(title_family_key, ' ')) >= 2
     ),
     dedup AS (
         SELECT * EXCLUDE (rn)
@@ -320,11 +363,40 @@ def historical_aoc_cycle_signals(root: str | Path, as_of=None, horizon_days: int
             FROM base
         )
         WHERE rn = 1
-    ),
+    )"""
+
+
+def historical_aoc_cycle_signals(root: str | Path, as_of=None, horizon_days: int = 365, limit: int | None = 100, state: str = "", city: str = "", keyword: str = "", date_column: str = "aoc_date", overdue_days: int = 45):
+    """Return evidence-backed recurring AOC opportunity windows.
+
+    Uses exact buyer + normalized requirement title as the conservative identity.
+    Two dated awards are enough to create an EARLY signal (one observed interval);
+    three or more awards create MEDIUM/HIGH signals with a more stable median cycle.
+    Only awards dated before ``as_of`` are used, so a past ``as_of`` reproduces
+    exactly what would have been predicted then (see backtest_aoc_signals).
+    Requirements whose expected next award is more than ``overdue_days``
+    before ``as_of`` are left out. This is a re-opportunity signal, never a
+    confirmed future tender.
+    """
+    duckdb = duckdb_available()
+    if duckdb is None:
+        raise RuntimeError("DuckDB is not installed. Run: python -m pip install duckdb")
+    root = Path(root)
+    pattern = str(root / "aoc_tenders" / "year=*" / "data.parquet").replace("\\", "/")
+    safe_pattern = pattern.replace("'", "''")
+    import datetime as _dt
+    as_of = _as_date(as_of)
+    horizon = as_of + _dt.timedelta(days=max(1, int(horizon_days)))
+    filter_sql, params = _aoc_filters(state, city, keyword)
+
+    con = duckdb.connect()
+    sql = f"""
+    WITH {_aoc_awards_ctes(safe_pattern, filter_sql, date_column)},
     dated AS (
         SELECT *,
-               LAG(award_date) OVER (PARTITION BY org_key, COALESCE(NULLIF(title_family_key, ''), title_key) ORDER BY award_date) AS prev_award_date
+               LAG(award_date) OVER (PARTITION BY org_key, title_family_key ORDER BY award_date) AS prev_award_date
         FROM dedup
+        WHERE award_date < DATE '{as_of.isoformat()}'
     ),
     gaps AS (
         SELECT *, DATE_DIFF('day', prev_award_date, award_date) AS gap_days
@@ -334,7 +406,7 @@ def historical_aoc_cycle_signals(root: str | Path, as_of=None, horizon_days: int
     ),
     stats AS (
         SELECT
-            org_key, COALESCE(NULLIF(title_family_key, ''), title_key) AS title_key,
+            org_key, title_family_key AS title_key,
             COUNT(*) + 1 AS award_count,
             MIN(prev_award_date) AS first_award_date,
             MAX(award_date) AS last_award_date,
@@ -342,13 +414,14 @@ def historical_aoc_cycle_signals(root: str | Path, as_of=None, horizon_days: int
             CAST(ROUND(quantile_cont(gap_days, 0.25)) AS INTEGER) AS q1_gap_days,
             CAST(ROUND(quantile_cont(gap_days, 0.75)) AS INTEGER) AS q3_gap_days,
             MAX(org_name) AS org_name,
-            MAX(title) AS title,
+            trim(regexp_replace(MAX_BY(title, award_date), '(&#?[a-zA-Z0-9]+;|\\s)+', ' ', 'g')) AS title,
+            MAX_BY(state, award_date) AS state,
             MAX_BY(tender_id, award_date) AS last_tender_id,
             MAX_BY(ref_no, award_date) AS last_ref_no,
             MAX_BY(portal_type, award_date) AS portal_type,
             MAX_BY(detail_url, award_date) AS last_detail_url
         FROM gaps
-        GROUP BY org_key, COALESCE(NULLIF(title_family_key, ''), title_key)
+        GROUP BY org_key, title_family_key
         HAVING COUNT(*) >= 1
     ),
     signals AS (
@@ -363,7 +436,8 @@ def historical_aoc_cycle_signals(root: str | Path, as_of=None, horizon_days: int
         WHERE median_gap_days BETWEEN 90 AND 1095
     )
     SELECT
-        org_name, title, award_count, first_award_date, last_award_date,
+        org_key, title_key AS family_key,
+        org_name, title, state, award_count, first_award_date, last_award_date,
         median_gap_days, q1_gap_days, q3_gap_days, expected_next_date,
         expected_next_date - window_half_width AS window_start,
         expected_next_date + window_half_width AS window_end,
@@ -375,12 +449,103 @@ def historical_aoc_cycle_signals(root: str | Path, as_of=None, horizon_days: int
           ELSE 'EARLY'
         END AS signal_strength
     FROM signals
-    WHERE expected_next_date BETWEEN DATE '{as_of.isoformat()}' - 45 AND DATE '{horizon.isoformat()}'
+    WHERE expected_next_date BETWEEN DATE '{as_of.isoformat()}' - {int(overdue_days)} AND DATE '{horizon.isoformat()}'
     ORDER BY
         CASE WHEN DATE '{as_of.isoformat()}' BETWEEN window_start AND window_end THEN 0 ELSE 1 END,
         ABS(DATE_DIFF('day', DATE '{as_of.isoformat()}', expected_next_date)),
         award_count DESC
     {f'LIMIT {int(limit)}' if limit else ''}
     """
-    return con.execute(sql).fetchdf()
+    return con.execute(sql, params).fetchdf()
 
+
+
+def backtest_aoc_signals(root: str | Path, as_of, horizon_days: int = 182, state: str = "", city: str = "", keyword: str = "", date_column: str = "aoc_date") -> dict[str, Any]:
+    """Score the re-tender predictions that would have been made on ``as_of``.
+
+    Predictions are generated from awards dated before ``as_of`` only, then
+    checked against the awards that actually followed. A prediction is a HIT
+    when the same buyer awarded the same requirement family again inside the
+    predicted window. ``baseline_hit_rate`` scores an equally wide window half
+    a cycle off, so the gap between the two shows how much the timing itself
+    is worth. Only predictions whose windows have fully closed by the end of
+    the available data are scored; the rest are reported as pending.
+    """
+    import datetime as _dt
+    import pandas as pd
+
+    duckdb = duckdb_available()
+    if duckdb is None:
+        raise RuntimeError("DuckDB is not installed. Run: python -m pip install duckdb")
+    as_of = _as_date(as_of)
+    root = Path(root)
+    pattern = str(root / "aoc_tenders" / "year=*" / "data.parquet").replace("\\", "/")
+    safe_pattern = pattern.replace("'", "''")
+    filter_sql, params = _aoc_filters(state, city, keyword)
+
+    signals = historical_aoc_cycle_signals(root, as_of=as_of, horizon_days=horizon_days, limit=None,
+                                           state=state, city=city, keyword=keyword, date_column=date_column)
+    con = duckdb.connect()
+    # The source has a thin tail of typo'd dates after its real cut-off (a few
+    # hundred rows a month, some in year 9999), so "end of data" is the 99.9th
+    # percentile award date, not the maximum. Windows closing after it can't be
+    # checked yet and stay pending instead of counting as misses.
+    future = con.execute(f"""
+        WITH {_aoc_awards_ctes(safe_pattern, filter_sql, date_column)},
+        cutoff AS (SELECT quantile_disc(award_date, 0.999) AS data_end FROM dedup)
+        SELECT org_key, title_family_key AS family_key, award_date, cutoff.data_end
+        FROM dedup, cutoff
+        WHERE award_date >= DATE '{as_of.isoformat()}' AND award_date <= cutoff.data_end
+    """, params).fetchdf()
+    data_end = future["data_end"].iloc[0].date() if not future.empty else as_of
+    future = future.drop(columns=["data_end"])
+
+    detail = signals[["org_key", "family_key", "org_name", "title", "signal_strength", "award_count",
+                      "median_gap_days", "last_award_date", "expected_next_date", "window_start", "window_end"]].copy()
+    detail["window_days"] = (detail["window_end"] - detail["window_start"]).dt.days
+    # Chance baseline: the same-width window moved half a cycle later, i.e. at
+    # the time the cycle says is least likely. If timing carries information,
+    # the real window must hit clearly more often than this one.
+    shift = pd.to_timedelta(detail["median_gap_days"] // 2, unit="D")
+    detail["baseline_start"] = detail["window_start"] + shift
+    detail["baseline_end"] = detail["window_end"] + shift
+    detail["scored"] = detail["baseline_end"].dt.date <= data_end
+
+    merged = detail[["org_key", "family_key", "window_start", "window_end", "baseline_start", "baseline_end"]].merge(
+        future, on=["org_key", "family_key"], how="inner")
+
+    def _keys_with_award_between(start_col, end_col):
+        inside = merged[(merged["award_date"] >= merged[start_col]) & (merged["award_date"] <= merged[end_col])]
+        return set(zip(inside["org_key"], inside["family_key"]))
+
+    hit_keys = _keys_with_award_between("window_start", "window_end")
+    baseline_keys = _keys_with_award_between("baseline_start", "baseline_end")
+    first_after = merged.groupby(["org_key", "family_key"])["award_date"].min()
+
+    keys = list(zip(detail["org_key"], detail["family_key"]))
+    detail["hit"] = [k in hit_keys for k in keys]
+    detail["baseline_hit"] = [k in baseline_keys for k in keys]
+    detail["next_actual_award"] = [first_after.get(k) for k in keys]
+    detail["error_days"] = [
+        (a - e).days if a is not None and not pd.isna(a) else None
+        for a, e in zip(detail["next_actual_award"], detail["expected_next_date"])
+    ]
+
+    rows = []
+    for label, group in [("All", detail)] + [(s, detail[detail["signal_strength"] == s]) for s in ("HIGH", "MEDIUM", "EARLY")]:
+        scored = group[group["scored"]]
+        errors = scored["error_days"].dropna().abs()
+        rows.append({
+            "evidence": label,
+            "predicted": len(group),
+            "scored": len(scored),
+            "pending": len(group) - len(scored),
+            "hits": int(scored["hit"].sum()),
+            "hit_rate": round(scored["hit"].mean(), 3) if len(scored) else None,
+            "baseline_hit_rate": round(scored["baseline_hit"].mean(), 3) if len(scored) else None,
+            "retendered_by_data_end": round(scored["next_actual_award"].notna().mean(), 3) if len(scored) else None,
+            "median_abs_error_days": int(errors.median()) if len(errors) else None,
+            "median_window_days": int(scored["window_days"].median()) if len(scored) else None,
+        })
+    return {"as_of": as_of, "horizon_days": horizon_days, "data_end": data_end,
+            "summary": pd.DataFrame(rows), "detail": detail.drop(columns=["org_key", "family_key", "baseline_start", "baseline_end"])}

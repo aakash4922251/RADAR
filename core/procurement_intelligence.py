@@ -76,7 +76,9 @@ def classify_document(filename: str, text: str, source_hint: str|None=None) -> t
     hay=(filename+"\n"+(source_hint or "")+"\n"+text[:25000]).lower()
     scores={k:0 for k in DOC_TYPES}
     rules={
-      "AOC":["award of contract","aoc","successful bidder","contract price"],
+      # CPPP "Tender Summary Report" after award: "Accepted-AOC", "Contract Date", "AOC document".
+      "AOC":["award of contract","aoc","successful bidder","contract price","accepted-aoc","contract date",
+             "aoc document","awarded bids list"],
       "WORK_ORDER":["work order","work order no","date of work order","you are requested to commence"],
       "CONTRACT":["agreement between","contract agreement","contract period","commencement date","contractor"],
       "TENDER":["tender id","tender reference number","critical dates","bid submission","tender value"],
@@ -227,7 +229,7 @@ def iter_zip(data: bytes, prefix=""):
             payload=z.read(info)
             if name.lower().endswith(".zip"):
                 yield from iter_zip(payload, prefix+name+"/")
-            elif Path(name).suffix.lower() in {".pdf",".txt",".docx",".doc",".xlsx",".xls",".csv"}:
+            elif Path(name).suffix.lower() in {".pdf",".txt",".docx",".doc",".xlsx",".xls",".csv",".jpg",".jpeg",".png",".tif",".tiff",".bmp",".webp"}:
                 yield prefix+name,payload
 
 def process_zip(conn,data:bytes,filename="upload.zip"):
@@ -243,7 +245,7 @@ def process_directory(conn, directory: str, recursive=True):
         if p.is_file() and p.suffix.lower()==".zip":
             try: results.extend(process_zip(conn,p.read_bytes(),p.name))
             except Exception as exc: results.append(ProcessResult(p.name,sha256_bytes(p.read_bytes()),"FAILED","OTHER",[],str(exc)))
-        elif p.is_file() and p.suffix.lower() in {".pdf",".txt",".docx",".doc",".xlsx",".xls",".csv"}:
+        elif p.is_file() and p.suffix.lower() in {".pdf",".txt",".docx",".doc",".xlsx",".xls",".csv",".jpg",".jpeg",".png",".tif",".tiff",".bmp",".webp"}:
             results.append(process_bytes(conn,p.read_bytes(),p.name))
     return results
 

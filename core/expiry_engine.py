@@ -21,7 +21,9 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
 
-from core.dateutils import add_months
+from core.dateutils import add_days, add_months
+
+AVERAGE_MONTH_DAYS = 30.4375  # must match core.duration._days_to_months
 from core.start_date import resolve_start_date, StartDateResolution
 
 
@@ -130,8 +132,15 @@ def compute_expiry(facts: list) -> ExpiryResult:
         )
         return result
 
-    base_expiry = add_months(start_res.start_date, round(duration_months))
-    formula = f"{start_res.start_date.isoformat()} + {duration_months:g} months = {base_expiry.isoformat()}"
+    if float(duration_months).is_integer():
+        base_expiry = add_months(start_res.start_date, int(duration_months))
+        formula = f"{start_res.start_date.isoformat()} + {duration_months:g} months = {base_expiry.isoformat()}"
+    else:
+        # Day-based terms ("completed within 20 days", "180 days") are stored as
+        # fractional months; count them in days instead of rounding to a month.
+        days = round(duration_months * AVERAGE_MONTH_DAYS)
+        base_expiry = add_days(start_res.start_date, days)
+        formula = f"{start_res.start_date.isoformat()} + {days} days = {base_expiry.isoformat()}"
 
     result = ExpiryResult(
         start_resolution=start_res,

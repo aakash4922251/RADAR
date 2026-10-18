@@ -1,13 +1,79 @@
 # Government Procurement Opportunity Radar
 
-An evidence-first system that analyzes Indian government procurement documents
-(NITs, corrigenda, AOCs, work orders, agreements) and determines, **with
-explicit evidence and confidence**, when an awarded contract is expected to
-become commercially contestable again.
+**Know which government contracts end — before the replacement tender is published.**
 
-Built to the **Trust & Evidence Architecture v2.0** specification: accuracy
-and evidence over coverage. If the system cannot reliably determine an expiry
-date, it says **UNKNOWN** instead of guessing.
+Tender portals tell a supplier about a tender once it is out. By then the
+buyer's requirement is fixed and competitors are already preparing. This
+product works one step earlier: it reads public award records and contract
+documents to show which contracts are ending, who holds them, what they are
+worth, and which buyers keep re-awarding the same work, with the published
+source behind every number.
+
+## Run it
+
+```bash
+python -m pip install -r requirements.txt
+winget install UB-Mannheim.TesseractOCR   # once; reads scans and photos (Linux: apt-get install tesseract-ocr)
+streamlit run app.py
+```
+
+**My contracts** accepts digital and scanned PDFs, phone photos (JPG/PNG/TIFF/WebP, any
+orientation, or the camera directly), Word (.docx), Excel (.xlsx), text and ZIPs of these.
+
+## What a customer gets
+
+| Screen | Answers | Source |
+|---|---|---|
+| **My contracts** (home) | Drop in award letters, work orders, agreements (PDF, Office, text, or a ZIP). Each contract's end date, latest possible end with extensions, buyer, supplier and evidence strength, nearest first. Proof Packet per contract. | The customer's own documents: always current, any buyer. |
+| **Contracts ending** | Which contracts end in the next 3/6/12 months, who holds them, their value and term, and whether the buyer has awarded the same work before. CSV export. | Completion dates published by the buyer in CPPP award-of-contract records. Nothing is estimated. |
+| **Buyer profiles** | For any buyer: contracts awarded, total value, competitiveness (median bids), most frequent winners, repeat requirements, contracts ending. **One-click branded PDF Opportunity Brief.** | All CPPP award records (619k contracts, 2021–2026). |
+| **Repeat buyers** | Buyers who keep awarding what you supply, ranked by strength of evidence. | CPPP award listings (2.67M records, 2021–2026). |
+| **Live tenders** | Scan CPPP for newly published tender notices. | CPPP. |
+
+## How accurate is it (measured, not claimed)
+
+Both screens have a "How reliable is this?" panel that re-runs the past
+(predictions from older data only, then checked against what happened). Reproduce
+from the command line with `python scripts/backtest_opportunities.py 2024-01-01 2025-01-01`.
+
+- **Published end dates carry timing information.** When a buyer re-awarded
+  the same work, 38–62% of re-awards came within 90 days of the published end
+  date. In three of four test periods a new award landed near the end date
+  1.4–2.7× as often as in an equally wide window at the wrong time; in the
+  earliest period (Jul 2023) there was no difference.
+- **Repeat buying is real.** 77–85% of "Strong" and 49–70% of "Medium" repeat
+  requirements were awarded again by the same buyer within ~1.5–2.5 years.
+- **Award history alone cannot time the next tender.** A window placed at the
+  predicted time hit no more often than one half a cycle off, so the Repeat
+  buyers screen shows no dates.
+
+## Data supply
+
+- **Customer documents** (My contracts) are the live source: always current, any buyer, no third-party
+  dependency.
+- **Public award history** (Contracts ending, Buyer profiles, Repeat buyers) is a snapshot that ends
+  June 2026. CPPP's award search is CAPTCHA-protected and its links are session-bound, so it cannot be
+  refreshed automatically without permission. A request for sanctioned access is drafted in
+  `docs/data_access_request_CPPP.md`. See VERIFICATION.md for the feasibility findings.
+
+## Known limits (stated, not hidden)
+
+- Completion dates are published by a few buyers today (HPCL, BHEL Hyderabad,
+  BPCL, GAIL, NPCIL, BHAVINI, NTPC, NLC, Power Grid, …): 23.8k contracts. Other
+  buyers' end dates come from their contract documents via **My contracts**.
+- Many contracts are one-off works that are never re-awarded (~12% were
+  re-awarded within the data), so each row is a lead to watch, not a promised
+  tender.
+- Supplier names are not yet merged across spellings ("LUBRIZOL" vs
+  "LUBRIZOL INDIA PVT LTD").
+- Data refreshes when new CPPP partitions are imported (Data Center →
+  Historical Data); the bundled data ends June 2026.
+
+## Engineering background
+
+The rest of this document describes the evidence-first contract pipeline
+(Trust & Evidence Architecture v2.0): if the system cannot reliably determine
+an expiry date, it says **UNKNOWN** instead of guessing.
 
 ```
 document → extract text → extract facts → capture evidence →
