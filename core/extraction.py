@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 from core.dateutils import parse_date_any
 from core.duration import extract_duration_candidates, CONTEXT_RADIUS
@@ -46,10 +45,13 @@ def _win(text: str, start: int, end: int) -> str:
 # we search the local window with parse_date_any.
 # ---------------------------------------------------------------------
 _DATE_FIELD_PATTERNS: list[tuple[str, re.Pattern, str, str]] = [
-    ("award_date", re.compile(r"(?:award(?:ed)?|AOC|acceptance\s*of\s*(?:tender|offer))[^.\d]{0,25}", re.I),
-     "P_AWARD_DATE_v2", "HIGH"),
+    ("award_date", re.compile(r"(?:\baward(?:ed)?|\bAOC\b|\bacceptance\s*of\s*(?:tender|offer))[^.\d]{0,25}", re.I),
+     "P_AWARD_DATE_v3", "HIGH"),
+    # CPPP AOC summaries: "Contract Date : 21-Sep-2026" is the date the contract was concluded.
+    ("award_date", re.compile(r"\bcontract\s*date\s*[:\-]?\s*", re.I), "P_CONTRACT_DATE_v1", "HIGH"),
     ("sanction_date", re.compile(r"sanction(?:ed)?[^.\d]{0,25}", re.I), "P_SANCTION_DATE_v1", "HIGH"),
-    ("loa_date", re.compile(r"letter\s*of\s*award[^.\d]{0,25}|LOA[^.\d]{0,25}", re.I), "P_LOA_DATE_v1", "HIGH"),
+    # Whole word only: "LOA" inside "DownLOAd" used to be read as a Letter of Award date.
+    ("loa_date", re.compile(r"\bletter\s*of\s*award[^.\d]{0,25}|\bLOA\b[^.\d]{0,25}", re.I), "P_LOA_DATE_v2", "HIGH"),
     ("work_order_date", re.compile(r"work\s*order[^.\d]{0,25}dated[^.\d]{0,15}", re.I),
      "P_WORK_ORDER_DATE_v1", "HIGH"),
     ("agreement_signed_date", re.compile(r"agreement\s*(?:signed|executed)[^.\d]{0,25}", re.I),
@@ -65,7 +67,7 @@ _DATE_FIELD_PATTERNS: list[tuple[str, re.Pattern, str, str]] = [
 
 # Contract value: ₹ / Rs. / INR figures
 _VALUE_RE = re.compile(
-    r"(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d+)?)\s*(?:/-|lakh|lakhs|crore|crores)?", re.I
+    r"(?:\bRs\.?|₹|\bINR\b)\s*([\d,]+(?:\.\d+)?)\s*(?:/-|lakh|lakhs|crore|crores)?", re.I
 )
 
 # Vendor / organisation cues (very lightweight — real NER is out of MVP
@@ -75,6 +77,34 @@ _VENDOR_RE = re.compile(r"M/s\.?\s+([A-Z][A-Za-z0-9&.,\-\s]{2,60}?)(?:,|\.|\n|$)
 _ORG_RE = re.compile(
     r"(?:tendering\s*authority|issued\s*by|department\s*of|office\s*of)[:\s]+"
     r"([A-Z][A-Za-z0-9&.,\-\s]{3,80}?)(?:\n|\.|,\s*(?:invites|hereby))",
+    re.I,
+)
+# NIC eProcurement printouts: "Organisation Chain : Ministry of X||Division Y". In
+# extracted PDF text the value may wrap onto a second line.
+_ORG_CHAIN_RE = re.compile(
+    r"Organisation\s*Chain\s*:?\s*([^\n]{3,200}(?:\n(?!\s*(?:Tender|Title)\b)[^\n:]{3,120})?)", re.I
+)
+
+# CPWD-style Schedule F field naming the office that issued the tender:
+# "Officer inviting tender : Assistant Commandant (Works), SHQ BSF Gandhinagar".
+# The value may wrap onto one short capitalised line ("... SHQ BSF\nGandhinagar").
+_INVITING_OFFICER_RE = re.compile(
+    r"Officer\s*inviting\s*tender\s*:?\s*([^\n]{3,120}(?:\n[A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,2}(?=\s*\n))?)", re.I
+)
+
+# Letterhead: Indian award letters and work orders usually open with the
+# buyer's name rather than saying "issued by". Only the first few lines are
+# considered, and only lines that name an organisation type.
+_LETTERHEAD_LINES = 8
+_ORG_WORD_RE = re.compile(
+    r"\b(corporation|limited|ltd|institute|university|department|ministry|government|govt|nigam|board|"
+    r"authority|municipal|council|commission|hospital|college|railway|directorate|office of|"
+    r"company|undertaking|bank|port trust|aiims|iit|nit)\b",
+    re.I,
+)
+_NOT_LETTERHEAD_RE = re.compile(
+    r"^\s*(m/s|to\b|subject|sub\b|ref|dear|letter of|work order|tender|notice|"
+    r"eprocurement system|government e-?marketplace|central public procurement portal)",
     re.I,
 )
 
@@ -144,6 +174,11 @@ _DURATION_KEYWORD_RE = re.compile(
 def _duration_fact_confidence(cand) -> str:
     if cand.fact_type == "base_duration_explicit_end_date":
         return "HIGH"
+    if cand.extraction_rule_id.startswith("P_COMPLETION_WITHIN"):
+        # "completed within N days" with no stated starting event: a stated
+        # contract period elsewhere outranks it. Anchored terms ("... from the
+        # date of work order", P_COMPLETION_FROM_EVENT) fall through to HIGH.
+        return "MEDIUM"
     if not cand.extraction_rule_id.startswith("P_SIMPLE"):
         return "HIGH"  # composite / plus-shorthand clauses already read as genuine duration clauses
     # bare "N years/months" needs a nearby duration keyword to earn HIGH;
@@ -169,9 +204,24 @@ def _find_duration_facts(text: str) -> list[Fact]:
     return facts
 
 
+# Amounts that are fees, deposits or taxes, not the value of the contract.
+_NOT_CONTRACT_VALUE_RE = re.compile(
+    r"\b(fee|fees|emd|earnest|tender\s*document|cost\s*of\s*tender|gst|cgst|sgst|igst|penalty|"
+    r"turnover|security\s*deposit|bank\s*guarantee|pbg|bid\s*security)\b",
+    re.I,
+)
+_VALUE_LOOKBACK = 60
+
+
 def _find_value_facts(text: str) -> list[Fact]:
     facts = []
     for m in _VALUE_RE.finditer(text):
+        # Judge the amount by its own label: the text on the same line before it
+        # ("EMD Amount in ₹", "Tender Fee in ₹", "GST amounting to Rs.").
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        label = text[max(line_start, m.start() - _VALUE_LOOKBACK):m.start()]
+        if _NOT_CONTRACT_VALUE_RE.search(label):
+            continue
         raw = m.group(1).replace(",", "")
         try:
             amount = float(raw)
@@ -195,8 +245,72 @@ def _find_value_facts(text: str) -> list[Fact]:
     return facts
 
 
+_ADDRESS_MARKER_RE = re.compile(r"\d|\b(road|marg|street|nagar|lane|pin|india|district|dist)\b", re.I)
+
+
+def _clean_letterhead(line: str) -> str:
+    """"eae VISVESVARAYA NATIONAL INSTITUTE OF TECHNOLOGY, SOUTH AMBAZARI ROAD,
+    NAGPUR — 440 010 (INDIA)" -> "VISVESVARAYA NATIONAL INSTITUTE OF TECHNOLOGY":
+    drop a short lower-case OCR fragment before the name and cut the postal
+    address that follows the first comma."""
+    # Leading OCR noise from logos and seals: tokens without letters ("36%",
+    # "|", "—") or short lower-case fragments ("eae") before the name.
+    tokens = line.split()
+    while len(tokens) > 1 and (not re.search(r"[A-Za-z]", tokens[0]) or re.fullmatch(r"[a-z]{1,4}", tokens[0])):
+        tokens.pop(0)
+    line = " ".join(tokens)
+    head, sep, rest = line.partition(",")
+    if sep and _ADDRESS_MARKER_RE.search(rest):
+        line = head
+    return line.strip(" ,.:;—-")
+
+
+# The supplier in a work order / award letter: the addressee after "To,", or,
+# when OCR loses "To,", the first line naming a business ("Bhagyshree Electrical,").
+_AWARD_LETTER_RE = re.compile(r"\b(work\s*order|letter\s*of\s*award|purchase\s*order|LOA)\b", re.I)
+_ADDRESSEE_RE = re.compile(r"^\s*To\s*,?\s*\n+\s*([A-Z][A-Za-z0-9&.\-' ]{2,80}?)\s*,?\s*$", re.M)
+_BUSINESS_LINE_RE = re.compile(
+    r"^\s*([A-Z][A-Za-z0-9&.\-' ]{2,70}?\b(?:Electricals?|Enterprises?|Engineers?|Engineering|Services|Traders|"
+    r"Constructions?|Contractors?|Agency|Agencies|Associates|Industries|Solutions|Works|Pvt\.?\s*Ltd\.?|"
+    r"Private\s+Limited|Limited|Ltd\.?|LLP|& Co\.?|and Company))\s*,\s*$",
+    re.M,
+)
+_DESIGNATION_RE = re.compile(r"\b(engineer|officer|manager|director|registrar|dean|secretary|commissioner|"
+                             r"the\s|sir|madam)\b", re.I)
+
+
+def _find_addressee_vendor(text: str) -> list[Fact]:
+    head = text[:3000]
+    if not _AWARD_LETTER_RE.search(head):
+        return []
+    for regex, rule, confidence in ((_ADDRESSEE_RE, "P_VENDOR_ADDRESSEE_v1", "MEDIUM"),
+                                    (_BUSINESS_LINE_RE, "P_VENDOR_BUSINESS_LINE_v1", "LOW")):
+        for m in regex.finditer(head):
+            name = m.group(1).strip()
+            if _DESIGNATION_RE.search(name + " ") or name.lower().startswith("m/s"):
+                continue
+            return [Fact(
+                fact_type="vendor_name", value=name, evidence_quote=m.group(0).strip(),
+                context_window=_win(text, m.start(), m.end()), char_offset_start=m.start(),
+                char_offset_end=m.end(), extraction_rule_id=rule, fact_confidence=confidence,
+            )]
+    return []
+
+
 def _find_entity_facts(text: str) -> list[Fact]:
     facts = []
+    m = _ORG_CHAIN_RE.search(text) or _INVITING_OFFICER_RE.search(text)
+    if m:
+        facts.append(Fact(
+            fact_type="organisation_name",
+            value=" ".join(m.group(1).split()),
+            evidence_quote=" ".join(m.group(0).split()),
+            context_window=_win(text, m.start(), m.end()),
+            char_offset_start=m.start(),
+            char_offset_end=m.end(),
+            extraction_rule_id="P_ORG_CHAIN_v1" if m.re is _ORG_CHAIN_RE else "P_ORG_INVITING_OFFICER_v1",
+            fact_confidence="HIGH",
+        ))
     for m in _VENDOR_RE.finditer(text):
         facts.append(Fact(
             fact_type="vendor_name",
@@ -208,7 +322,17 @@ def _find_entity_facts(text: str) -> list[Fact]:
             extraction_rule_id="P_VENDOR_MS_v1",
             fact_confidence="MEDIUM",
         ))
+    if not any(f.fact_type == "vendor_name" for f in facts):
+        facts += _find_addressee_vendor(text)
     for m in _ORG_RE.finditer(text):
+        name = m.group(1).strip()
+        # Sentence fragments and generic roles, not names: "Maharashtra State for
+        # the work detailed in the table by the", "tender opening authority",
+        # "the Government of India", "concerned Executive".
+        if (len(name.split()) > 10 or re.search(r"\b(the|by|of|for|in)$", name, re.I)
+                or name[:1].islower() or re.match(r"(the|concerned)\b", name, re.I)
+                or re.search(r"\bauthority$", name, re.I)):
+            continue
         facts.append(Fact(
             fact_type="organisation_name",
             value=m.group(1).strip(),
@@ -219,6 +343,30 @@ def _find_entity_facts(text: str) -> list[Fact]:
             extraction_rule_id="P_ORG_ISSUEDBY_v1",
             fact_confidence="MEDIUM",
         ))
+    if not any(f.fact_type == "organisation_name" for f in facts):
+        offset = 0
+        seen = 0
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped:
+                seen += 1
+                if seen > _LETTERHEAD_LINES or _NOT_LETTERHEAD_RE.match(stripped):
+                    if seen > _LETTERHEAD_LINES:
+                        break
+                elif 6 <= len(stripped) <= 120 and _ORG_WORD_RE.search(stripped):
+                    start = offset + line.index(stripped)
+                    facts.append(Fact(
+                        fact_type="organisation_name",
+                        value=_clean_letterhead(stripped),
+                        evidence_quote=stripped,
+                        context_window=_win(text, start, start + len(stripped)),
+                        char_offset_start=start,
+                        char_offset_end=start + len(stripped),
+                        extraction_rule_id="P_ORG_LETTERHEAD_v1",
+                        fact_confidence="LOW",
+                    ))
+                    break
+            offset += len(line)
     return facts
 
 
@@ -300,10 +448,43 @@ def _find_absolute_ceiling_facts(text: str) -> list[Fact]:
     return facts
 
 
+_WORK_ORDER_HEADING_RE = re.compile(r"\bWORK\s+ORDER\b", re.I)
+_DATED_RE = re.compile(r"\bdated\b", re.I)
+
+
+def _find_work_order_heading_date(text: str) -> list[Fact]:
+    """A work order's own date: the first date after "Dated" just below the
+    WORK ORDER heading. Scans and OCR often split "Dated:" and the date across
+    lines (sometimes with stray characters between), which the generic
+    "work order dated <date>" pattern cannot see."""
+    heading = _WORK_ORDER_HEADING_RE.search(text[:3000])
+    if not heading:
+        return []
+    dated = _DATED_RE.search(text, heading.end(), heading.end() + 400)
+    if not dated:
+        return []
+    window = text[dated.end():dated.end() + 60]
+    d = parse_date_any(window)
+    if d is None:
+        return []
+    return [Fact(
+        fact_type="work_order_date",
+        value=d.isoformat(),
+        evidence_quote=" ".join(text[heading.start():dated.end() + 60].split())[:200],
+        context_window=_win(text, heading.start(), dated.end() + 60),
+        char_offset_start=heading.start(),
+        char_offset_end=dated.end() + len(window),
+        extraction_rule_id="P_WORK_ORDER_HEADING_DATE_v1",
+        fact_confidence="HIGH",
+    )]
+
+
 def extract_all_facts(text: str) -> list[Fact]:
     """Run every extractor and return the combined, evidence-backed fact list."""
     facts: list[Fact] = []
     facts += _find_date_facts(text)
+    if not any(f.fact_type == "work_order_date" for f in facts):
+        facts += _find_work_order_heading_date(text)
     facts += _find_duration_facts(text)
     facts += _find_value_facts(text)
     facts += _find_entity_facts(text)

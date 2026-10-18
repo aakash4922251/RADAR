@@ -34,11 +34,9 @@ def build_proof_packet_text(cur, contract_id: int) -> str:
     vendor = cur.execute("SELECT name FROM vendors WHERE id = ?", (contract["vendor_id"],)).fetchone()
 
     facts = db.get_facts_for_contract(cur, contract_id)
-    calc = db.get_latest_calculation(cur, contract_id)
     conf = db.get_latest_confidence(cur, contract_id)
     documents = db.list_documents_for_contract(cur, contract_id)
     open_conflicts = db.list_open_conflicts(cur, contract_id)
-    timeline = db.list_timeline_for_contract(cur, contract_id)
 
     lines = []
     lines.append("CONTRACT EXPIRY PROOF")

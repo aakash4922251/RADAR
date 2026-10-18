@@ -10,7 +10,7 @@ single collapsed number, per spec §4.6 / example #4.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from core.reject_patterns import classify_context, RejectClass
@@ -117,10 +117,66 @@ _RENEWABLE_ANNUAL_RE = re.compile(r"\brenew(?:able|ed)\s*(?:annually|every\s*yea
 # ---------------------------------------------------------------------
 # Pattern 5: explicit calendar range "from <date> to <date>"
 # ---------------------------------------------------------------------
+# One date token inside a range; mirrors the shapes dateutils.parse_date_any
+# understands, including DD/MM/YYYY \u2014 the commonest form in Indian NITs/AOCs.
+_RANGE_DATE = (
+    r"\d{1,2}(?:st|nd|rd|th)?[\s\-/]+[A-Za-z]{3,9}['\u2019]?[\s\-/,]*\d{4}"  # 1st April, 2024
+    r"|\d{4}-\d{1,2}-\d{1,2}"                                              # 2024-04-01
+    r"|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4}"                                    # 01/04/2024, 01.04.2024
+)
 _RANGE_RE = re.compile(
-    r"\bfrom\s+(?P<start>\d{1,2}(?:st|nd|rd|th)?[\s\-/]+[A-Za-z]{3,9}['\u2019]?[\s\-/,]*\d{4}|\d{4}-\d{1,2}-\d{1,2})"
-    r"\s+(?:to|till|until)\s+"
-    r"(?P<end>\d{1,2}(?:st|nd|rd|th)?[\s\-/]+[A-Za-z]{3,9}['\u2019]?[\s\-/,]*\d{4}|\d{4}-\d{1,2}-\d{1,2})",
+    rf"\bfrom\s+(?P<start>{_RANGE_DATE})\s+(?:to|till|until|upto|up\s+to)\s+(?P<end>{_RANGE_DATE})",
+    re.I,
+)
+# A date range is a bid-schedule window, not a contract period, when the words
+# just before it are about the tender process: "Bid document can be downloaded
+# from 31.08.2026 to 28.09.2026", "sale of tender document from ...".
+_BID_SCHEDULE_RE = re.compile(
+    r"\b(download\w*|sale|bid\s*(?:due|submission|opening|closing|document)|submission\s*of\s*bids?|"
+    r"opening\s*of\s*bids?|pre[\s-]?bid|clarification|publish\w*)\b",
+    re.I,
+)
+_BID_SCHEDULE_LOOKBACK = 100
+
+# ---------------------------------------------------------------------
+# Pattern 6: structured work-period fields printed by the NIC eProcurement
+# portal ("Period Of Work(Days) 180", "Work Completion Period in days : 30").
+# Label and number are often on separate lines in extracted PDF text.
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Pattern 6a: the labelled contract term of a tender / CPWD-style document
+# ("Time allowed : 15 Days", "The time allowed for carrying out the work will
+# be 15 days", "Time allowed for execution of work : 15 Days", "Period of
+# completion: 6 months", "Contract period : 2 years").
+# ---------------------------------------------------------------------
+_LABELLED_TERM_RE = re.compile(
+    r"\b(?:time\s*allowed(?:\s*for\s*(?:carrying\s*out|execution\s*of|completion\s*of)\s*(?:the\s*)?work)?"
+    r"|period\s*of\s*completion|completion\s*period|time\s*of\s*completion"
+    r"|contract\s*period|period\s*of\s*(?:the\s*)?contract)"
+    r"\s*(?:will\s*be|shall\s*be|is)?\s*[:\-]?\s*"
+    r"(?P<num>" + _NUM_ALT + r")\s*(?:\(\s*\d+\s*\)\s*)?(?P<unit>days?|weeks?|months?|years?)\b",
+    re.I,
+)
+
+_PORTAL_PERIOD_RE = re.compile(
+    r"\b(?:work\s*completion\s*period|completion\s*period|period\s*of\s*work)\s*"
+    r"(?:in\s*days|\(\s*days\s*\))\s*:?\s*(?P<num>\d{1,4})\b",
+    re.I,
+)
+
+# ---------------------------------------------------------------------
+# Pattern 7: completion term of a work order ("work to be delivered/completed
+# within 20 Days from the date of work order"). This is the job's own term,
+# so a nearby "Delivery Period:" label does not disqualify it, but warranty,
+# bid-validity and the other reject contexts still do.
+# ---------------------------------------------------------------------
+_COMPLETION_RE = re.compile(
+    r"\bcomplet(?:ed|ion)\s*(?:of\s*(?:the\s*)?work\s*)?within\s*(?P<num>" + _NUM_ALT + r")\s*"
+    r"(?:\(\s*\d+\s*\)\s*)?(?P<unit>days?|weeks?|months?)\b"
+    # "... from the date of work order / award / agreement": the term is counted
+    # from a named contract event, which makes it the job's own term.
+    r"(?P<anchor>\s*from\s*(?:the\s*)?date\s*of\s*(?:the\s*)?"
+    r"(?:work\s*order|award|letter\s*of\s*award|LOA|agreement|commencement|start))?",
     re.I,
 )
 
@@ -169,11 +225,57 @@ def extract_duration_candidates(text: str) -> list[DurationCandidate]:
         start_d = parse_date_any(m.group("start"))
         end_d = parse_date_any(m.group("end"))
         if start_d and end_d and end_d > start_d:
-            candidates.append(_make_candidate(
+            cand = _make_candidate(
                 text, "base_duration_explicit_end_date",
                 f"{start_d.isoformat()}|{end_d.isoformat()}", m, "P_EXPLICIT_RANGE_v1"
-            ))
+            )
+            if _BID_SCHEDULE_RE.search(text[max(0, m.start() - _BID_SCHEDULE_LOOKBACK):m.start()]):
+                cand.accepted = False
+                cand.reject_class = RejectClass.BID_SCHEDULE.value
+            candidates.append(cand)
             consumed_spans.append((m.start(), m.end()))
+
+    # 1a. Labelled contract term: the document states it as its term, so accepted as stated
+    for m in _LABELLED_TERM_RE.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        num = _number_from_match(m.group("num"))
+        if num is None:
+            continue
+        unit = m.group("unit").lower()
+        days = num if unit.startswith("day") else num * 7 if unit.startswith("week") else None
+        value = _days_to_months(days) if days is not None else num * _unit_months(unit)
+        cand = _make_candidate(text, "base_duration_months", value, m, "P_LABELLED_TERM_v1")
+        cand.accepted, cand.reject_class = True, None
+        candidates.append(cand)
+        consumed_spans.append((m.start(), m.end()))
+
+    # 1b. Portal work-period fields: structured, so accepted as stated
+    for m in _PORTAL_PERIOD_RE.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        cand = _make_candidate(text, "base_duration_months", _days_to_months(int(m.group("num"))), m,
+                               "P_PORTAL_WORK_PERIOD_v1")
+        cand.accepted, cand.reject_class = True, None
+        candidates.append(cand)
+        consumed_spans.append((m.start(), m.end()))
+
+    # 1c. "completed within N days/weeks/months"
+    for m in _COMPLETION_RE.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        num = _number_from_match(m.group("num"))
+        if num is None:
+            continue
+        unit = m.group("unit").lower()
+        days = num if unit.startswith("day") else num * 7 if unit.startswith("week") else None
+        value = _days_to_months(days) if days is not None else num
+        rule = "P_COMPLETION_FROM_EVENT_v1" if m.group("anchor") else "P_COMPLETION_WITHIN_v1"
+        cand = _make_candidate(text, "base_duration_months", value, m, rule)
+        if cand.reject_class == RejectClass.DELIVERY_PERIOD.value:
+            cand.accepted, cand.reject_class = True, None
+        candidates.append(cand)
+        consumed_spans.append((m.start(), m.end()))
 
     # 2. Composite base + extension clause (examples #4-#7)
     for m in _COMPOSITE_RE.finditer(text):

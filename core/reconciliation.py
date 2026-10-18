@@ -39,6 +39,9 @@ _SUPERSEDABLE_TYPES = {
     "contract_value", "vendor_name", "organisation_name",
 }
 
+_NAME_TYPES = {"vendor_name", "organisation_name"}
+_CONFIDENCE_RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
+
 # Numeric fact types where small differences are tolerated as
 # "compatible" (e.g. "2 years" vs "730 days" within a few days).
 _NUMERIC_TOLERANCE_DAYS = 3
@@ -73,14 +76,33 @@ def reconcile_new_document(cur, contract_id: int, new_document_id: int) -> dict:
     summary = {"conflicts": [], "superseded": [], "corroborated": []}
 
     for new_fact in new_facts:
+        # Cross-document reconciliation only: several values of one type inside
+        # a single document (a fee, a deposit and the work value on one tender
+        # page) are not one source contradicting another. Duration disagreements
+        # within a document are still caught by the expiry engine.
         existing = [
             f for f in db.get_facts_for_contract(cur, contract_id, fact_type=new_fact["fact_type"])
-            if f["id"] != new_fact["id"]
+            if f["id"] != new_fact["id"] and f["document_id"] != new_fact["document_id"]
         ]
         for old_fact in existing:
             if _values_compatible(new_fact["fact_type"], old_fact["fact_value"], new_fact["fact_value"]):
                 summary["corroborated"].append((old_fact["id"], new_fact["id"]))
                 continue
+
+            # Names read with different strength of evidence (a letterhead guess
+            # vs the portal's own "Organisation Chain") are not a contradiction:
+            # the stronger reading replaces the weaker one.
+            if new_fact["fact_type"] in _NAME_TYPES:
+                old_strength = _CONFIDENCE_RANK.get(old_fact["fact_confidence"], 0)
+                new_strength = _CONFIDENCE_RANK.get(new_fact["fact_confidence"], 0)
+                if new_strength > old_strength:
+                    db.supersede_fact(cur, old_fact["id"], new_fact["id"])
+                    summary["superseded"].append((old_fact["id"], new_fact["id"]))
+                    continue
+                if old_strength > new_strength:
+                    db.supersede_fact(cur, new_fact["id"], old_fact["id"])
+                    summary["superseded"].append((new_fact["id"], old_fact["id"]))
+                    continue
 
             # contradictory
             if new_fact["fact_type"] not in _SUPERSEDABLE_TYPES:

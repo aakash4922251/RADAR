@@ -9,11 +9,7 @@ might already exist under a slightly different title, so a reviewer (or
 the uploader) can choose to link the document to the existing contract
 instead of creating a duplicate.
 
-Uses the standard library's difflib rather than rapidfuzz: rapidfuzz is
-listed in requirements.txt for future use, but a stdlib-only
-implementation means this feature works with zero extra dependencies,
-which matters most for exactly the kind of offline/locked-down
-environment this MVP is meant to run in.
+Uses the standard library's difflib, so it needs no extra dependency.
 """
 from __future__ import annotations
 

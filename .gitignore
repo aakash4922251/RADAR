@@ -15,3 +15,7 @@ venv/
 
 # Local editor files
 .vscode/
+
+# Real scanned document with a private contractor's personal phone/email.
+# Kept on disk for local OCR tests (which skip gracefully if it's absent).
+tests/fixtures/WONEWELECTRIFICATIONATNEWLYPROPOSEDFACULTYROOMSNEWMETALLURGICAL.pdf

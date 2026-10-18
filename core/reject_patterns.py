@@ -22,6 +22,10 @@ class RejectClass(str, Enum):
     EXPERIENCE_TURNOVER = "experience_turnover"
     PBG_EMD_VALIDITY = "pbg_emd_validity"
     MOBILISATION_PAYMENT = "mobilisation_payment"
+    # Tender-process windows (document download/sale, bid submission). Applied
+    # by core.duration to date ranges only, using the words just before the
+    # range rather than the whole context window.
+    BID_SCHEDULE = "bid_schedule"
     NONE = "none"
 
 
@@ -44,7 +48,10 @@ _REJECT_PATTERNS: list[tuple[RejectClass, re.Pattern]] = [
     (
         RejectClass.WARRANTY_DLP,
         re.compile(
-            r"\b(warrant(y|ies)|defect\s*liability\s*period|DLP)\b", re.I
+            # "Warrantee" is a common spelling in Indian work orders. Plain
+            # "guarantee" is deliberately not here: "performance bank guarantee"
+            # sits next to real contract periods (see PBG_EMD_VALIDITY).
+            r"\b(warrant(y|ies|ee|ees)|defect\s*liability\s*period|DLP)\b", re.I
         ),
     ),
     (

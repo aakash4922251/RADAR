@@ -1,31 +1,28 @@
-# VERIFICATION - what was actually run, and what was not
+# Verification — what was run, and what was not
 
-Environment: sandbox with **no network**, Python 3.12.
+Last run: 2026-10-18, Windows 11, Python 3.14, Streamlit 1.64, Tesseract 5.4.
 
-## Verified (executed)
-* **200 tests pass** (`python tools/mini_pytest_runner.py .`).
-  CAVEAT: pytest could not be installed offline, so these were run with a small pytest-compatible runner in `tools/`
-  (supports the fixtures / parametrize / raises / approx / importorskip used here). The test files are standard pytest;
-  **run `pytest` yourself** to confirm under the real thing.
-* **Mutation check:** re-introducing 5 bugs (off-by-one expiry, work-order date single-valued [original bug #2], new-end cue
-  disabled [original bug #1], HIGH prediction without 4 intervals, corrigendum filter off) made 17 / 2 / 20 / 3 / 1 tests fail.
-* Both original known bugs are fixed and regression-tested; the "Extension work order dated 15-Feb-2028. New contractual end
-  date is 31-Mar-2028." case yields extension_order_date=2028-02-15, new end=2028-03-31, current expiry 2028-03-31.
-* Real PDFs (generated with reportlab) through the **pdfplumber** path incl. page-number citation.
-* **OCR** on an image-only PDF (tesseract + poppler were available here); the test skips itself where they are absent.
-  OCR accuracy on real scanned tenders is unknown - only a clean synthetic image was tried.
-* URL fetcher against a **local** HTTP server: text/PDF/HTML success; robots.txt, 403, 429, CAPTCHA and login refusals.
-* SQLite schema v3 initialises; constraints reject `is_prediction=0` and non-prediction `kind`.
-* End-to-end demo: `python demo_data/demo_seed.py --reset --as-of 2026-09-20` produces the scenarios in the README.
-* `app.py` compiles and every page executes against seeded data **under a stub Streamlit** (`tests/streamlit_stub.py`).
+## Verified
 
-## NOT VERIFIED
-* **Real Streamlit was never started** (not installable offline). The stub proves the code runs; it does not prove real
-  widget behaviour or layout. Run `streamlit run app.py` and look.
-* **PyMuPDF (fitz) path**: not installed here, so not exercised (the pdfplumber fallback is).
-* **Real government portals** (CPPP, GeM, state sites): no live access attempted; extraction was tested on synthetic text and
-  the small `real_examples.jsonl` fixture only. Accuracy on real, messy tender PDFs is **unknown**.
-* Prediction quality on real data is untested; thresholds (CV cut-offs, 90-day merge gap, +/-30d window floor) are reasoned
-  defaults, not calibrated.
-* The earlier session's claims of "37/51 tests" and a "FINAL zip" could not be reconciled with any file provided; this build
-  was made from the PRE_BUGFIX zip.
+* `python -m pytest`: **85 passed.** Real documents under `tests/fixtures/` pin each fix:
+
+  | Document | Result |
+  |---|---|
+  | BSF Gandhinagar NIT (67 pages, CPWD boilerplate) | Tender stage, contract period 15 days ("Time allowed : 15 Days"), no false conflict from boilerplate periods, buyer "Assistant Commandant (Works), SHQ BSF Gandhinagar" |
+  | Same NIT + an award letter quoting its N.I.T No. | Linked automatically; ends 2026-12-05 (award 20 Nov + 15 days) |
+  | MoRTH NH-66 tender notice + portal tender page | Linked by tender reference; tender stage; buyer = MoRTH organisation chain; bid-download window not read as a contract period |
+  | VNIT CPPP award summary | Ends 2026-10-21 (contract date 21 Sep + 30 days) |
+  | VNIT work order, scanned PDF (OCR) and photos of it, upright and rotated 90° | Ends 2026-10-06 (work order 16 Sep + 20 days), supplier read from the addressee |
+  | Same award summary + work order | Work order outranks the summary; replaced 30-day term stays visible |
+
+* The app (`app.py`) driven under real Streamlit with these documents: upload, list,
+  contract detail, re-read, remove.
+
+## Not verified
+
+* Real phone photos (glare, curled pages, perspective).
+* Document layouts beyond the fixtures above.
+* Hindi text (English OCR data only).
+
+The full earlier build (public award-data screens, buyer profiles, repeat buyers,
+backtests) is preserved on branch `backup/full-build-2026-10-18`.

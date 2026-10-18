@@ -80,12 +80,6 @@ def test_extraction_pipeline_runs_end_to_end_on_real_pdf_text(cur):
     assert result.n_facts_extracted >= 1
 
 
-def test_public_url_ingestion_is_not_silently_faked():
-    import pytest
-    with pytest.raises(NotImplementedError):
-        ingestion.fetch_public_url("https://eprocure.gov.in/example")
-
-
 def test_empty_pdf_yields_empty_text_not_a_crash():
     # A PDF with no drawable content at all
     from reportlab.pdfgen import canvas

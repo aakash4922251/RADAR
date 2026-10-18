@@ -1,20 +1,7 @@
-from datetime import datetime
-
 import streamlit as st
 
 
-def environment_for_hour(hour: int) -> tuple[str, str, str]:
-    if 5 <= hour < 11:
-        return "morning", "234, 244, 252", "255, 240, 210"
-    if 11 <= hour < 17:
-        return "afternoon", "220, 240, 252", "255, 255, 255"
-    if 17 <= hour < 21:
-        return "evening", "249, 233, 226", "255, 226, 202"
-    return "night", "226, 235, 248", "244, 247, 255"
-
-
-def apply_theme(now: datetime | None = None):
-    period, sky_rgb, light_rgb = environment_for_hour((now or datetime.now().astimezone()).hour)
+def apply_theme():
     st.markdown(
         """
         <style>
@@ -34,20 +21,15 @@ def apply_theme(now: datetime | None = None):
             --amber-pale: #fff4df;
             --red: #a93636;
             --line: #d7e3ed;
-            --sky-wash: __SKY_WASH__;
-            --light-wash: __LIGHT_WASH__;
         }
         html, body, [class*="css"] { font-family: 'DM Sans', 'Aptos', sans-serif; color: var(--ink); }
-        [data-testid="stAppViewContainer"] {
-            color: var(--ink);
-            background:
-                radial-gradient(ellipse at 82% -8%, rgba(var(--light-wash), .82) 0, transparent 35%),
-                radial-gradient(ellipse at 8% 0%, rgba(var(--sky-wash), .72) 0, transparent 42%),
-                linear-gradient(165deg, #f8fbfe 0%, #f5f9fd 52%, #f3f8fb 100%);
-        }
+        [data-testid="stAppViewContainer"] { color: var(--ink); background: #f5f8fb; }
         [data-testid="stHeader"] { background: transparent; }
-        [data-testid="stMainBlockContainer"] { max-width: 1380px; padding: 1.6rem 2rem 3rem; }
-        [data-testid="stSidebar"] { background: rgba(250,253,255,.9); border-right: 1px solid var(--line); }
+        [data-testid="stMainBlockContainer"] { max-width: 1440px; padding: 1.6rem 2.2rem 3rem; }
+        [data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid var(--line); }
+        [data-testid="stSidebar"]::before {
+            content: ""; display: block; height: 4px; background: linear-gradient(90deg, var(--navy), var(--blue));
+        }
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
         [data-testid="stSidebar"] label { color: var(--muted); }
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
@@ -80,10 +62,9 @@ def apply_theme(now: datetime | None = None):
         [data-testid="stRadio"] label, [data-testid="stCheckbox"] label,
         [data-testid="stSelectbox"] label, [data-testid="stTextInput"] label { color: var(--ink) !important; }
         [data-testid="stMetric"] {
-            background: transparent; border: 0; border-right: 1px solid var(--line); border-radius: 0;
-            padding: .65rem 1.1rem; box-shadow: none;
+            background: #fff; border: 1px solid var(--line); border-radius: 10px;
+            padding: .8rem 1.1rem; box-shadow: 0 1px 2px rgba(23,52,81,.04);
         }
-        [data-testid="column"]:last-child [data-testid="stMetric"] { border-right: 0; }
         [data-testid="stMetricLabel"] { color: var(--muted); font-size: .86rem; }
         [data-testid="stMetricValue"] { color: var(--ink); font-weight: 650; animation: metric-arrive .32s ease-out both; }
         [data-testid="stVerticalBlockBorderWrapper"] {
@@ -98,7 +79,8 @@ def apply_theme(now: datetime | None = None):
         h1 { font-size: 2rem; font-weight: 700; }
         h2 { font-size: 1.3rem; font-weight: 650; }
         h3 { font-size: 1.05rem; font-weight: 650; }
-        .radar-brand { color: var(--ink); font-size: 1.12rem; font-weight: 700; padding: .5rem 0 .1rem; }
+        .radar-brand { color: var(--navy); font-size: 1.12rem; font-weight: 700; letter-spacing: .04em; padding: .5rem 0 .1rem; }
+        .page-subtitle { max-width: 860px; }
         .radar-brand-sub { color: var(--muted); font-size: .8rem; margin-bottom: .7rem; }
         .nav-section { color: #55718a; font-size: .76rem; font-weight: 650; margin: 1rem 0 .3rem; }
         .eyebrow { color: #28638f; font-size: .76rem; font-weight: 650; text-transform: uppercase; }
@@ -134,6 +116,6 @@ def apply_theme(now: datetime | None = None):
             *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
         }
         </style>
-        """.replace("__SKY_WASH__", sky_rgb).replace("__LIGHT_WASH__", light_rgb),
+        """,
         unsafe_allow_html=True,
     )

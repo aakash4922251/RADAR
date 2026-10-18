@@ -17,11 +17,13 @@ Implements the exact representation required by spec §4.6:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
-from core.dateutils import add_months
+from core.dateutils import add_days, add_months
+
+AVERAGE_MONTH_DAYS = 30.4375  # must match core.duration._days_to_months
 from core.start_date import resolve_start_date, StartDateResolution
 
 
@@ -88,6 +90,13 @@ def compute_expiry(facts: list) -> ExpiryResult:
     duration_confidence = "UNKNOWN"
     duration_source_id = None
 
+    # A term the document states as its term (labelled field, composite or
+    # completion clause) outranks bare "N days / N years" mentions, which in a
+    # long tender are mostly boilerplate (bid validity, experience, guarantees).
+    stated = [f for f in duration_facts if not str(dict(f).get("extraction_rule_id") or "P_SIMPLE").startswith("P_SIMPLE")]
+    if stated:
+        duration_facts = stated
+
     if duration_facts:
         # prefer HIGH-confidence facts (composite/explicit rules) over MEDIUM (simple pattern)
         high = [f for f in duration_facts if f["fact_confidence"] == "HIGH"]
@@ -130,8 +139,15 @@ def compute_expiry(facts: list) -> ExpiryResult:
         )
         return result
 
-    base_expiry = add_months(start_res.start_date, round(duration_months))
-    formula = f"{start_res.start_date.isoformat()} + {duration_months:g} months = {base_expiry.isoformat()}"
+    if float(duration_months).is_integer():
+        base_expiry = add_months(start_res.start_date, int(duration_months))
+        formula = f"{start_res.start_date.isoformat()} + {duration_months:g} months = {base_expiry.isoformat()}"
+    else:
+        # Day-based terms ("completed within 20 days", "180 days") are stored as
+        # fractional months; count them in days instead of rounding to a month.
+        days = round(duration_months * AVERAGE_MONTH_DAYS)
+        base_expiry = add_days(start_res.start_date, days)
+        formula = f"{start_res.start_date.isoformat()} + {days} days = {base_expiry.isoformat()}"
 
     result = ExpiryResult(
         start_resolution=start_res,

@@ -33,8 +33,8 @@ _DATE_PATTERNS = [
     ),
     # ISO: 2025-03-14
     re.compile(r"\b(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})\b"),
-    # 14/03/2025 or 14-03-2025 (DD/MM/YYYY, Indian convention)
-    re.compile(r"\b(?P<day>\d{1,2})[/-](?P<month>\d{1,2})[/-](?P<year>\d{4})\b"),
+    # 14/03/2025, 14-03-2025 or 14.03.2025 (DD/MM/YYYY, Indian convention)
+    re.compile(r"\b(?P<day>\d{1,2})[/.-](?P<month>\d{1,2})[/.-](?P<year>\d{4})\b"),
 ]
 
 

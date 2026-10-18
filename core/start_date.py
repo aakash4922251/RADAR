@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
-from core.dateutils import parse_date_any
 
 
 @dataclass
@@ -33,8 +32,9 @@ def resolve_start_date(facts: list) -> StartDateResolution:
          start component) — HIGH
       2. commencement_date_explicit — HIGH
       3. site_handover_date — HIGH
-      4. award_date used as proxy (no commencement clause found) — MEDIUM
-      5. No usable signal — UNKNOWN
+      4. work_order_date used as proxy — MEDIUM
+      5. award_date used as proxy (no commencement clause found) — MEDIUM
+      6. No usable signal — UNKNOWN
     """
     by_type: dict[str, list] = {}
     for f in facts:
@@ -69,7 +69,20 @@ def resolve_start_date(facts: list) -> StartDateResolution:
             note="Site-handover date separately published.",
         )
 
-    # 4. Award date as proxy — explicitly labelled, confidence capped at MEDIUM
+    # 4. Work-order date as proxy — a work order instructs the work to begin and
+    # its terms usually run "from the date of work order". Still an assumption,
+    # so labelled and capped at MEDIUM like the award-date proxy below.
+    if "work_order_date" in by_type:
+        f = by_type["work_order_date"][0]
+        d = date.fromisoformat(f["fact_value"])
+        return StartDateResolution(
+            start_date=d, confidence="MEDIUM", source_fact_id=f["id"],
+            note="No commencement/site-handover clause found; the work-order date is being "
+                 "used as a PROXY for start date (work-order terms usually run from that date). "
+                 "Treat the resulting expiry date as provisional.",
+        )
+
+    # 5. Award date as proxy — explicitly labelled, confidence capped at MEDIUM
     if "award_date" in by_type:
         f = by_type["award_date"][0]
         d = date.fromisoformat(f["fact_value"])
@@ -81,7 +94,7 @@ def resolve_start_date(facts: list) -> StartDateResolution:
                  "as provisional.",
         )
 
-    # 5. Nothing usable
+    # 6. Nothing usable
     return StartDateResolution(
         start_date=None, confidence="UNKNOWN", source_fact_id=None,
         note="No award date, commencement date, or site-handover date found in any "
