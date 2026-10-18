@@ -14,6 +14,7 @@ import os
 import sys
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -22,7 +23,7 @@ from core.contract_tracker import portfolio, track_documents
 from core.ingestion import SUPPORTED_EXTENSIONS, ocr_available
 from core.proof_packet import build_proof_packet_text
 from db import database as db
-from ui_labels import evidence_label, status_label
+from ui_labels import evidence_label, period_label, status_label
 from ui_shared import close_page_connections, get_cursor, init_page
 from ui_theme import apply_theme
 
@@ -108,46 +109,54 @@ if mine:
             continue
         row = book.loc[contract_id]
         ends = row["current_expiry_estimate"] if isinstance(row["current_expiry_estimate"], str) else None
+        has_evidence = row["stage"] != "TENDER" and row["expiry_confidence"] in PILL_CLASS
 
-        st.markdown('<div class="result-card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="result-title">{row["title"]}</div>', unsafe_allow_html=True)
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            if ends:
-                st.markdown('<div class="result-end-label">Contract ends</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="result-end">{ends}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="result-end-label">Status</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="result-end" style="font-size:1.2rem;">'
-                           f'{status_label(row["status"], row["stage"])}</div>', unsafe_allow_html=True)
-            buyer = row["buyer"]
-            if isinstance(buyer, str) and buyer.strip():
-                st.markdown(f'<div class="result-meta">Buyer: {buyer.split("||")[0].strip()}</div>',
-                           unsafe_allow_html=True)
-        with c2:
-            pill = PILL_CLASS.get(row["expiry_confidence"], "evidence-early")
-            st.markdown(f'<span class="{pill}">{evidence_label(row["expiry_confidence"], row["stage"])} evidence</span>',
-                        unsafe_allow_html=True)
-            ceiling = row["current_expiry_ceiling"]
-            if isinstance(ceiling, str) and ceiling != ends:
-                st.caption(f"Latest possible: {ceiling}")
+        # A real Streamlit container, not a hand-written <div> — Streamlit
+        # renders each st.markdown() call as its own sibling element, so an
+        # opening tag in one call and a closing tag in a later one never
+        # actually wraps the widgets in between; only st.container() does.
+        with st.container(border=True, key=f"result_{contract_id}"):
+            st.markdown(f'<div class="result-title">{row["title"]}</div>', unsafe_allow_html=True)
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                if ends:
+                    st.markdown('<div class="result-end-label">Contract ends</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="result-end">{ends}</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown('<div class="result-end-label">Status</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="result-end" style="font-size:1.2rem;">'
+                               f'{status_label(row["status"], row["stage"])}</div>', unsafe_allow_html=True)
+                buyer = row["buyer"]
+                if isinstance(buyer, str) and buyer.strip():
+                    st.markdown(f'<div class="result-meta">Buyer: {buyer.split("||")[0].strip()}</div>',
+                               unsafe_allow_html=True)
+            with c2:
+                if has_evidence:
+                    pill = PILL_CLASS[row["expiry_confidence"]]
+                    st.markdown(f'<span class="{pill}">{evidence_label(row["expiry_confidence"], row["stage"])} '
+                               f'evidence</span>', unsafe_allow_html=True)
+                    ceiling = row["current_expiry_ceiling"]
+                    if isinstance(ceiling, str) and ceiling != ends:
+                        st.caption(f"Latest possible: {ceiling}")
+                elif pd.notna(row["period_months"]):
+                    st.caption(f"Contract period once awarded: {period_label(row['period_months'])}")
 
-        with st.expander("See the proof"):
-            calc = db.get_latest_calculation(cur, contract_id)
-            fact_ids = json.loads(calc["input_fact_ids"]) if calc and calc["input_fact_ids"] else []
-            all_facts = db.get_facts_for_contract(cur, contract_id, include_superseded=True)
-            shown = [f for f in all_facts if f["id"] in fact_ids] or [f for f in all_facts if not f["superseded_by_fact_id"]]
-            if not shown:
-                st.caption("No usable dates were found in this document.")
-            for f in shown:
-                st.write(f"**{f['fact_type'].replace('_', ' ').capitalize()}:** “{f['evidence_quote']}”")
-            if db.list_open_conflicts(cur, contract_id):
-                st.warning("Your documents disagree on at least one date — add the missing document to settle "
-                           "it, or treat this as provisional.")
-            packet = build_proof_packet_text(cur, contract_id)
-            st.download_button("Download full Proof Packet", data=packet,
-                               file_name=f"proof_packet_{contract_id}.txt", key=f"dl_{contract_id}")
-        st.markdown("</div>", unsafe_allow_html=True)
+            with st.expander("See the proof"):
+                calc = db.get_latest_calculation(cur, contract_id)
+                fact_ids = json.loads(calc["input_fact_ids"]) if calc and calc["input_fact_ids"] else []
+                all_facts = db.get_facts_for_contract(cur, contract_id, include_superseded=True)
+                shown = ([f for f in all_facts if f["id"] in fact_ids]
+                        or [f for f in all_facts if not f["superseded_by_fact_id"]])
+                if not shown:
+                    st.caption("No usable dates were found in this document.")
+                for f in shown:
+                    st.write(f"**{f['fact_type'].replace('_', ' ').capitalize()}:** “{f['evidence_quote']}”")
+                if db.list_open_conflicts(cur, contract_id):
+                    st.warning("Your documents disagree on at least one date — add the missing document to "
+                               "settle it, or treat this as provisional.")
+                packet = build_proof_packet_text(cur, contract_id)
+                st.download_button("Download full Proof Packet", data=packet,
+                                   file_name=f"proof_packet_{contract_id}.txt", key=f"dl_{contract_id}")
 
 st.markdown(
     '<div class="trust-note">Nothing is estimated silently — every date is read from your documents, '

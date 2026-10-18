@@ -97,8 +97,12 @@ _PUBLIC = """
             display: inline-flex; align-items: center; justify-content: center; font-weight: 800; font-size: .85rem; margin-bottom: .5rem; }
 .step-label { font-weight: 700; color: var(--ink); font-size: .95rem; }
 .step-copy { color: var(--muted); font-size: .86rem; margin-top: .15rem; }
-.result-card { background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 1.4rem 1.6rem;
-               box-shadow: 0 4px 18px rgba(23,52,81,.06); margin-bottom: 1rem; }
+/* Result cards are real st.container(border=True, key="result_...") blocks —
+   this targets them specifically (vs. other bordered containers on the page)
+   without needing one CSS rule per dynamic key. */
+[class*="st-key-result_"] [data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 16px !important; box-shadow: 0 4px 18px rgba(23,52,81,.06) !important;
+}
 .result-title { font-weight: 700; font-size: 1.08rem; color: var(--ink); margin-bottom: .3rem; }
 .result-end { font-size: 1.55rem; font-weight: 800; color: var(--navy); }
 .result-end-label { color: var(--muted); font-size: .82rem; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
